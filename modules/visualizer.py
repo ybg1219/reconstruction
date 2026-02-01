@@ -89,3 +89,108 @@ def visualize_npy_sdf(filepath, vmin=-1, vmax=1):
     ax.set_title(f"3D Reconstruction ({len(verts)} vertices)")
     plt.tight_layout()
     plt.show()
+
+def plot_particles_and_sdf_slice(sdf_grid, particles, axis=2, slice_idx=None):
+    """
+    SDF 단면(2D) 위에 파티클 위치를 함께 시각화합니다.
+    Args:
+        sdf_grid: (N,N,N) SDF 배열
+        particles: (M,3) 파티클 좌표 (월드 좌표계)
+        axis: 단면 축 (0,1,2)
+        slice_idx: 단면 인덱스 (None이면 중앙)
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    N = sdf_grid.shape[axis]
+    if slice_idx is None:
+        slice_idx = N // 2
+    # SDF 단면 추출
+    if axis == 0:
+        sdf_slice = sdf_grid[slice_idx, :, :]
+        x, y = 1, 2
+    elif axis == 1:
+        sdf_slice = sdf_grid[:, slice_idx, :]
+        x, y = 0, 2
+    else:
+        sdf_slice = sdf_grid[:, :, slice_idx]
+        x, y = 0, 1
+    plt.figure(figsize=(7,6))
+    plt.title(f"SDF Slice + Particles (axis={axis}, idx={slice_idx})")
+    plt.imshow(sdf_slice, cmap='RdBu', vmin=-1, vmax=1, origin='lower')
+    plt.colorbar(label='SDF Value')
+    plt.contour(sdf_slice, levels=[0], colors='black', linewidths=2)
+    # 파티클을 그리드 인덱스로 변환
+    domain_size = 2.0
+    min_bound = -domain_size/2
+    max_bound = domain_size/2
+    res = sdf_grid.shape[0]
+    voxel_size = domain_size / (res-1)
+    # 월드좌표 -> 인덱스
+    idx_x = np.clip(np.round((particles[:,x] - min_bound) / voxel_size), 0, res-1)
+    idx_y = np.clip(np.round((particles[:,y] - min_bound) / voxel_size), 0, res-1)
+    plt.scatter(idx_y, idx_x, s=5, c='yellow', edgecolors='k', alpha=0.7, label='Particles')
+    plt.legend()
+    plt.show()
+    
+def plot_particles_and_mesh(sdf_grid, particles, domain_size=2.0, level=0):
+    """
+    SDF로 추출한 3D 메쉬와 파티클을 같은 좌표계에서 시각화합니다.
+    
+    Args:
+        sdf_grid: (N,N,N) SDF 배열 (값)
+        particles: (M,3) 파티클 좌표 (월드 좌표계)
+        domain_size: 물리적 공간 크기 (예: 2.0이면 -1.0 ~ 1.0)
+        level: 마칭큐브 등가면 값 (보통 0)
+    """
+    
+    # 1. Marching Cubes (그리드 인덱스 좌표 추출: 0 ~ N-1)
+    try:
+        verts, faces, normals, values = measure.marching_cubes(sdf_grid, level=level)
+    except ValueError:
+        print("⚠️ 경고: 등가면(Surface)을 찾을 수 없습니다. (SDF가 모두 양수거나 음수임)")
+        return
+
+    # 2. [중요] 메쉬 좌표 변환 (Index -> World)
+    # 공식: MinBound + (Index / (Resolution-1)) * DomainSize
+    resolution = sdf_grid.shape[0]
+    min_bound = -domain_size / 2.0
+    
+    # 정점 좌표 스케일링
+    verts_world = min_bound + verts * (domain_size / (resolution - 1))
+
+    # 3. 시각화 설정
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # (1) 메쉬 그리기 (투명하게)
+    mesh = Poly3DCollection(verts_world[faces], alpha=0.15) # 투명도 높임
+    mesh.set_facecolor('skyblue')
+    mesh.set_edgecolor('gray')
+    mesh.set_linewidth(0.1)
+    ax.add_collection3d(mesh)
+
+    # (2) 파티클 그리기 (최적화)
+    # 파티클이 너무 많으면 뷰어가 느려지므로 최대 2000개만 샘플링해서 보여줌
+    if len(particles) > 2000:
+        step = len(particles) // 2000
+        p_show = particles[::step]
+    else:
+        p_show = particles
+        
+    ax.scatter(p_show[:, 0], p_show[:, 1], p_show[:, 2], 
+               s=3, c='orange', alpha=0.8, label='Particles')
+
+    # 4. 축 범위 설정 (도형 전체가 보이도록 고정)
+    limit = domain_size / 2.0
+    ax.set_xlim(-limit, limit)
+    ax.set_ylim(-limit, limit)
+    ax.set_zlim(-limit, limit)
+
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_title(f'SDF Mesh + Particles ({len(particles)} count)')
+    ax.legend(loc='upper right')
+    
+    plt.tight_layout()
+    plt.show()
