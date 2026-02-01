@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from skimage import measure
 
 def plot_slice(sdf_grid, axis=2, slice_idx=None):
@@ -48,3 +49,43 @@ def save_mesh_as_obj(sdf_grid, filename="output.obj", level=0):
         
     except Exception as e:
         print(f"❌ 메쉬 생성 실패: 데이터가 비어있거나 표면이 없습니다. ({e})")
+
+def visualize_npy_sdf(filepath, vmin=-1, vmax=1):
+    """
+    .npy로 저장된 SDF 3D grid를 2D slice와 3D marching cubes로 시각화합니다.
+    Args:
+        filepath: npy 파일 경로
+        vmin, vmax: 컬러맵 범위
+    """
+
+    try:
+        grid_data = np.load(filepath)
+        print(f"📂 파일 로드 성공! 데이터 크기: {grid_data.shape}")
+    except FileNotFoundError:
+        print("❌ 파일을 찾을 수 없습니다. 먼저 SDF를 저장하세요.")
+        return
+
+    # --- [시각화 1] 2D 단면 검사 ---
+    mid_index = grid_data.shape[2] // 2
+    slice_data = grid_data[:, :, mid_index]
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.title(f"2D Slice (Z={mid_index})")
+    plt.imshow(slice_data, cmap='RdBu', vmin=vmin, vmax=vmax, origin='lower')
+    plt.colorbar(label='SDF Value')
+    plt.contour(slice_data, levels=[0], colors='black', linewidths=2)
+
+    # --- [시각화 2] 3D 형상 복원 (마칭 큐브) ---
+    verts, faces, normals, values = measure.marching_cubes(grid_data, level=0)
+    ax = plt.subplot(1, 2, 2, projection='3d')
+    mesh = Poly3DCollection(verts[faces], alpha=0.70)
+    mesh.set_facecolor('skyblue')
+    mesh.set_edgecolor('k')
+    mesh.set_linewidth(0.1)
+    ax.add_collection3d(mesh)
+    ax.set_xlim(0, grid_data.shape[0])
+    ax.set_ylim(0, grid_data.shape[1])
+    ax.set_zlim(0, grid_data.shape[2])
+    ax.set_title(f"3D Reconstruction ({len(verts)} vertices)")
+    plt.tight_layout()
+    plt.show()
