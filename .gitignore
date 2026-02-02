@@ -5,6 +5,7 @@
 .conda/
 env/
 envs/
+condaenv.*.requirements.txt
 
 # Python venv 환경 폴더
 venv/
