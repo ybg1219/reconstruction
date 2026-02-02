@@ -1,6 +1,5 @@
 import numpy as np
-from sdf import sphere, box, cylinder
-
+from sdf import sphere, box, cylinder, rounded_box, torus, capsule, capped_cylinder, capped_cone
 def create_sample_shape():
     """
     테스트용 SDF 도형 정의
@@ -51,63 +50,98 @@ def to_grid(sdf_func, resolution=64, domain_size=2.0):
 # =========================================================
 # 랜덤 모양 생성기 (새로 추가된 부분)
 # =========================================================
-
 def create_random_shape(seed=None):
     """
-    3~7개의 기본 도형을 랜덤하게 결합하여 복잡한 SDF 모양을 생성합니다.
-    
-    Args:
-        seed: 랜덤 시드 (재현 가능성 확보용)
+    SDF 라이브러리의 다양한 도형(캡슐, 도넛, 원뿔대 등)을 
+    랜덤하게 결합하여 복잡한 SDF 모양을 생성합니다.
     """
     if seed is not None:
         np.random.seed(seed)
     
-    # 1. 도형 개수 결정 (3개 ~ 7개)
+    # 1. 도형 개수 결정
     num_shapes = np.random.randint(3, 8)
     
-    # 최종 결과 변수
     final_sdf = None
     
+    # 문서에 있는 3D Primitives 적극 활용
+    shape_choices = ['sphere', 'box', 'rounded_box', 'capped_cylinder', 'capsule', 'torus', 'capped_cone']
+    
     for i in range(num_shapes):
-        # 2. 도형 타입 랜덤 선택 (구, 박스, 원기둥)
-        shape_type = np.random.choice(['sphere', 'box', 'cylinder'])
+        shape_type = np.random.choice(shape_choices)
         
-        # 3. 크기 랜덤 설정 (0.1 ~ 0.5 사이)
-        # 너무 크면 화면을 꽉 채우고, 너무 작으면 안 보임
-        size_param = np.random.uniform(0.1, 0.5)
+        obj = None
         
+        # 공통적으로 사용할 랜덤 벡터 (시작점 a, 끝점 b)
+        # 중심에서 약간 벗어난 두 지점을 잡아서 도형의 방향성을 만듦
+        p_start = np.random.uniform(-0.3, 0.3, 3)
+        p_end = np.random.uniform(-0.3, 0.3, 3)
+        
+        # --- 도형 생성 로직 ---
         if shape_type == 'sphere':
-            obj = sphere(size_param)
+            radius = np.random.uniform(0.1, 0.4)
+            obj = sphere(radius)
+            
         elif shape_type == 'box':
-            # 박스는 x,y,z 비율을 다르게 해서 직육면체로 만듦
-            dims = np.random.uniform(0.1, 0.5, 3)
+            dims = np.random.uniform(0.1, 0.4, 3)
             obj = box(dims)
-        elif shape_type == 'cylinder':
-            obj = cylinder(size_param)
+            
+        elif shape_type == 'rounded_box':
+            dims = np.random.uniform(0.1, 0.4, 3)
+            r = np.random.uniform(0.02, 0.1)
+            obj = rounded_box(dims, r)
+            
+        elif shape_type == 'capped_cylinder':
+            # 문서: capped_cylinder(a, b, radius)
+            radius = np.random.uniform(0.05, 0.2)
+            obj = capped_cylinder(p_start, p_end, radius)
+            
+        elif shape_type == 'capsule':
+            # 문서: capsule(a, b, radius)
+            radius = np.random.uniform(0.05, 0.2)
+            obj = capsule(p_start, p_end, radius)
+            
+        elif shape_type == 'torus':
+            # 문서: torus(r1, r2) -> r1=major, r2=minor
+            r_major = np.random.uniform(0.2, 0.5)
+            r_minor = np.random.uniform(0.05, 0.15)
+            if r_minor >= r_major: r_minor = r_major * 0.5
+            obj = torus(r_major, r_minor)
+            
+        elif shape_type == 'capped_cone':
+            # 문서: capped_cone(a, b, ra, rb)
+            ra = np.random.uniform(0.1, 0.3)
+            rb = np.random.uniform(0.0, 0.2) # 0이면 뾰족한 원뿔
+            obj = capped_cone(p_start, p_end, ra, rb)
 
-        # 4. 회전 (Rotation) - 3D 공간감을 위해 임의의 축으로 회전
-        # (원기둥이나 박스는 회전해야 자연스러움)
-        angle = np.random.uniform(0, 360)
-        axis = np.random.uniform(-1, 1, 3)
-        axis = axis / np.linalg.norm(axis) # 단위 벡터화
-        obj = obj.rotate(angle, axis)
+        # 4. 회전 (Rotation) 
+        # a, b 점을 사용하는 도형(캡슐, 원기둥 등)은 이미 회전된 상태지만,
+        # 구, 박스, 도넛은 추가 회전이 필요할 수 있음
+        if shape_type in ['sphere', 'box', 'rounded_box', 'torus']:
+            angle = np.random.uniform(0, 360)
+            axis = np.random.uniform(-1, 1, 3)
+            if np.linalg.norm(axis) > 0:
+                axis = axis / np.linalg.norm(axis)
+                obj = obj.rotate(angle, axis)
 
-        # 5. 위치 이동 (Translation) - 중심(-1~1) 내에서 이동
-        # 너무 멀리 가면 잘리므로 -0.5 ~ 0.5 범위 내로 제한
-        pos = np.random.uniform(-0.5, 0.5, 3)
+        # 5. 위치 이동 (Translation)
+        # a, b를 사용하는 도형은 이미 위치가 잡혀있으므로, 추가 이동은 살짝만
+        pos = np.random.uniform(-0.2, 0.2, 3)
         obj = obj.translate(pos)
         
-        # 6. 결합 (Union vs Difference)
+        # 6. 결합
         if final_sdf is None:
-            final_sdf = obj # 첫 번째 도형은 그대로 사용
+            final_sdf = obj
         else:
-            # 합집합(Union) 확률 70%, 차집합(Difference) 확률 30%
-            # 차집합이 너무 많으면 도형이 다 사라질 수 있어서 비율 조절
-            op = np.random.choice(['union', 'diff'], p=[0.7, 0.3])
-            
+            op = np.random.choice(['union', 'diff', 'smooth'], p=[0.6, 0.2, 0.2])
             if op == 'union':
                 final_sdf = final_sdf | obj
-            else:
+            elif op == 'diff':
                 final_sdf = final_sdf - obj
-                
+            elif op == 'smooth':
+                # k값이 너무 크면 형태가 뭉개지므로 작게(0.05~0.1) 설정
+                try:
+                    final_sdf = final_sdf.smooth_union(obj, k=0.1)
+                except:
+                    final_sdf = final_sdf | obj
+
     return final_sdf
