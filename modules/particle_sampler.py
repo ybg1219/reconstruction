@@ -8,67 +8,67 @@ from modules.sdf_generator import to_grid # SDF 값 확인을 위해 필요하�
 
 def sample_particles_poisson(sdf_grid, domain_size=2.0, num_particles=10000):
     """
-    SciPy의 Poisson Disk Sampling을 사용하여 SDF 내부에 파티클을 배치합니다.
-    (파티클끼리 너무 가까워지지 않도록 최소 거리를 보장합니다.)
-    
-    Args:
-        sdf_grid: (N, N, N) 크기의 SDF 그리드 (필터링용)
-        domain_size: 물리적 공간 크기 (기본 2.0)
-        num_particles: 목표 파티클 개수 (이 개수를 맞추기 위해 반지름을 자동 조절함)
-        
-    Returns:
-        valid_particles: (M, 3) 크기의 파티클 좌표 배열
+    SDF 내부 부피를 고려하여 목표 개수(num_particles)만큼 파티클을 생성합니다.
     """
     resolution = sdf_grid.shape[0]
     
-    # 1. Poisson Disk의 반지름(최소 거리) 추정
-    # (목표 개수를 채우기 위해 전체 부피 대비 적절한 반지름을 역산)
-    # 3차원 공간 부피 = domain_size^3
-    volume = domain_size ** 3
-    # 대략적인 반지름 추정 (조금 여유 있게 설정)
-    radius = (volume / num_particles) ** (1/3) * 0.5
+    # [핵심 수정 1] 도형이 차지하는 비율(Fill Ratio) 계산
+    # 전체 복셀 중 내부(음수)인 복셀의 비율을 구합니다.
+    valid_voxels = np.sum(sdf_grid < 0)
+    total_voxels = sdf_grid.size
     
-    print(f"   -> 목표 파티클: {num_particles}개 / 추정 최소 거리(r): {radius:.4f}")
+    if valid_voxels == 0:
+        print("⚠️ 경고: SDF 내부에 공간이 없습니다 (너무 작거나 없음).")
+        return np.empty((0, 3))
+        
+    fill_ratio = valid_voxels / total_voxels
+    
+    # [핵심 수정 2] 전체 부피가 아닌 '도형 부피'를 기준으로 반지름 설정
+    # 전체 박스 부피
+    total_volume = domain_size ** 3
+    
+    # 실제 도형의 추정 부피
+    shape_volume = total_volume * fill_ratio
+    
+    # 목표 개수를 맞추기 위한 반지름 계산
+    # (도형 부피 안에 num_particles개가 들어가도록 밀도 설정)
+    # * 0.45는 안전 계수 (목표보다 약간 더 많이 생성해서 잘라내기 위함)
+    radius = (shape_volume / num_particles) ** (1/3) * 0.45
+    
+    print(f"   -> 부피 비율: {fill_ratio*100:.1f}%")
+    print(f"   -> 목표: {num_particles}개 / 보정된 반지름(r): {radius:.4f}")
 
-    # 2. SciPy 엔진 초기화 (3차원)
-    # hypersphere='volume'은 고차원 샘플링 최적화 옵션
+    # 2. SciPy 엔진 초기화
     engine = qmc.PoissonDisk(d=3, radius=radius, hypersphere='volume', ncandidates=30)
     
-    # 3. 샘플링 (0.0 ~ 1.0 사이의 정규화된 좌표가 나옴)
-    # fill_space는 주어진 반지름으로 공간을 꽉 채웁니다.
+    # 3. 샘플링 (전체 공간 채우기)
     try:
         sample_points = engine.fill_space()
     except Exception as e:
-        print(f"⚠️ 샘플링 실패 (반지름이 너무 큼): {e}")
+        print(f"⚠️ 샘플링 실패: {e}")
         return np.empty((0, 3))
         
-    # 4. 좌표 변환 (0~1  --->  -domain/2 ~ +domain/2)
-    # min_bound: -1.0, max_bound: 1.0
+    # 4. 좌표 변환 (0~1 -> -domain/2 ~ +domain/2)
     min_bound = -domain_size / 2.0
     max_bound = domain_size / 2.0
-    
-    # 스케일링 공식: min + point * (max - min)
     world_points = min_bound + sample_points * (max_bound - min_bound)
     
-    # 5. SDF 내부 필터링 (Rejection Sampling)
-    # 생성된 포인트가 실제로 SDF 도형 안에 있는지 검사해야 함
-    
-    # (1) 월드 좌표 -> 그리드 인덱스로 변환
+    # 5. SDF 내부 필터링
     voxel_size = domain_size / (resolution - 1)
     grid_indices = (world_points - min_bound) / voxel_size
     grid_indices = np.round(grid_indices).astype(int)
-    
-    # (2) 인덱스가 배열 범위(0 ~ resolution-1)를 벗어나지 않도록 클립
     grid_indices = np.clip(grid_indices, 0, resolution - 1)
     
-    # (3) 해당 위치의 SDF 값을 조회
-    # sdf_values[x, y, z]
-    sdf_values_at_points = sdf_grid[grid_indices[:, 0], grid_indices[:, 1], grid_indices[:, 2]]
+    sdf_values = sdf_grid[grid_indices[:, 0], grid_indices[:, 1], grid_indices[:, 2]]
     
-    # (4) SDF < 0 (내부)인 것만 남기기
-    mask = sdf_values_at_points < 0
+    mask = sdf_values < 0
     valid_particles = world_points[mask]
     
+    # [추가] 너무 많이 생성됐으면 목표 개수만큼 자르기 (정확한 개수 맞춤)
+    if len(valid_particles) > num_particles:
+        # 랜덤하게 섞어서 자르거나 앞에서부터 자름
+        valid_particles = valid_particles[:num_particles]
+        
     return valid_particles
 
 def sample_particles_jittered(sdf_grid, domain_size=2.0, jitter_scale=0.8):
