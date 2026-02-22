@@ -3,6 +3,9 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from skimage import measure
 
+import open3d as o3d
+import os
+
 # =========================================================
 # 0. 메쉬 저장 함수 (OBJ 파일로 저장) 
 # =========================================================
@@ -151,6 +154,7 @@ def visualize_simulation(sdf_grid=None, particles=None, domain_size=2.0, title="
     plt.tight_layout()
     plt.show()
 
+
 def visualize_npy(filepath, domain_size=2.0):
     """
     .npy 파일을 로드하여 시각화합니다.
@@ -169,3 +173,40 @@ def visualize_npy(filepath, domain_size=2.0):
             
     except FileNotFoundError:
         print(f"❌ 파일을 찾을 수 없습니다: {filepath}")
+
+
+def view_obj_interactive(filename="output.obj"):
+    """
+    Open3D를 사용하여 OBJ 파일을 별도의 창에서 인터랙티브하게 봅니다.
+    마우스로 회전(좌클릭), 이동(우클릭), 줌(휠)이 가능합니다.
+    """
+    if not os.path.exists(filename):
+        print(f"❌ 파일을 찾을 수 없습니다: {filename}")
+        return
+
+    print(f"🖥️ 3D 뷰어 실행 중: {filename} ...")
+    
+    try:
+        # 1. 메쉬 읽기
+        mesh = o3d.io.read_triangle_mesh(filename)
+        
+        # 2. 렌더링 품질 향상을 위한 법선 벡터(Normal) 계산
+        # (이게 없으면 모델이 평평해 보임)
+        mesh.compute_vertex_normals()
+        
+        # 3. 좌표축 표시 (선택사항)
+        coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5, origin=[0, 0, 0])
+        
+        # 4. 시각화 창 띄우기
+        o3d.visualization.draw_geometries(
+            [mesh, coord_frame], 
+            window_name="SDF 3D Viewer",
+            width=800,
+            height=600,
+            left=50,
+            top=50
+        )
+        print("✅ 뷰어 종료됨.")
+        
+    except Exception as e:
+        print(f"❌ 뷰어 실행 중 오류 발생: {e}")
