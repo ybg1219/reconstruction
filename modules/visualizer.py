@@ -1,7 +1,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from mpl_toolkits.mplot3d import Axes3D
 from skimage import measure
+import torch
 
 import open3d as o3d
 import os
@@ -210,3 +212,146 @@ def view_obj_interactive(filename="output.obj"):
         
     except Exception as e:
         print(f"❌ 뷰어 실행 중 오류 발생: {e}")
+
+
+# =========================================================
+# 4. SDF Network 시각화 함수들
+# =========================================================
+
+def visualize_feature_grid(m_c_grid: torch.Tensor, 
+                          grid_nodes: torch.Tensor,
+                          title: str = "Grid Features (m_c)",
+                          figsize: tuple = (10, 8)) -> plt.Figure:
+    """
+    그리드 특징값(m_c) 시각화
+    
+    Args:
+        m_c_grid: (Gx, Gy, Gz) 3D 그리드 특징값
+        grid_nodes: (G, 3) 그리드 노드 좌표
+        title: 그래프 제목
+        figsize: 그림 크기
+    
+    Returns:
+        fig: matplotlib Figure 객체
+    """
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # m_c 값에 따라 색상 설정
+    m_c_flat = m_c_grid.reshape(-1).cpu().numpy() if isinstance(m_c_grid, torch.Tensor) else m_c_grid.reshape(-1)
+    scatter = ax.scatter(
+        grid_nodes[:, 0].cpu().numpy() if isinstance(grid_nodes, torch.Tensor) else grid_nodes[:, 0],
+        grid_nodes[:, 1].cpu().numpy() if isinstance(grid_nodes, torch.Tensor) else grid_nodes[:, 1],
+        grid_nodes[:, 2].cpu().numpy() if isinstance(grid_nodes, torch.Tensor) else grid_nodes[:, 2],
+        c=m_c_flat,
+        cmap='viridis',
+        s=10,
+        alpha=0.6
+    )
+    
+    cbar = plt.colorbar(scatter, ax=ax, label='m_c value')
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_title(title)
+    plt.tight_layout()
+    return fig
+
+
+def visualize_sdf(sdf_values: torch.Tensor, 
+                 grid_nodes: torch.Tensor,
+                 title: str = "SDF Reconstruction",
+                 figsize: tuple = (10, 8)) -> plt.Figure:
+    """
+    SDF 값 시각화
+    
+    Args:
+        sdf_values: (G,) SDF 값
+        grid_nodes: (G, 3) 그리드 노드 좌표
+        title: 그래프 제목
+        figsize: 그림 크기
+    
+    Returns:
+        fig: matplotlib Figure 객체
+    """
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection='3d')
+    
+    sdf_np = sdf_values.cpu().numpy() if isinstance(sdf_values, torch.Tensor) else sdf_values
+    scatter = ax.scatter(
+        grid_nodes[:, 0].cpu().numpy() if isinstance(grid_nodes, torch.Tensor) else grid_nodes[:, 0],
+        grid_nodes[:, 1].cpu().numpy() if isinstance(grid_nodes, torch.Tensor) else grid_nodes[:, 1],
+        grid_nodes[:, 2].cpu().numpy() if isinstance(grid_nodes, torch.Tensor) else grid_nodes[:, 2],
+        c=sdf_np,
+        cmap='RdBu',
+        s=10,
+        alpha=0.6
+    )
+    
+    cbar = plt.colorbar(scatter, ax=ax, label='SDF value')
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_title(title)
+    plt.tight_layout()
+    
+    plt.show()
+    return fig
+
+
+def visualize_particles_and_features(particles: torch.Tensor,
+                                     grid_nodes: torch.Tensor,
+                                     m_c_grid: torch.Tensor,
+                                     title: str = "Particles and Grid Features",
+                                     figsize: tuple = (12, 8)) -> plt.Figure:
+    """
+    파티클과 그리드 특징값 함께 시각화
+    
+    Args:
+        particles: (N, 3) 파티클 좌표
+        grid_nodes: (G, 3) 그리드 노드 좌표
+        m_c_grid: (Gx, Gy, Gz) 또는 (G,) 그리드 특징값
+        title: 그래프 제목
+        figsize: 그림 크기
+    
+    Returns:
+        fig: matplotlib Figure 객체
+    """
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # 파티클 시각화 (빨간색)
+    particles_np = particles.cpu().numpy() if isinstance(particles, torch.Tensor) else particles
+    ax.scatter(particles_np[:, 0],
+               particles_np[:, 1],
+               particles_np[:, 2],
+               c='red', s=30, label='Particles', alpha=0.7)
+    
+    # 그리드 노드 시각화 (색상: m_c 값)
+    if isinstance(m_c_grid, torch.Tensor):
+        m_c_flat = m_c_grid.reshape(-1).cpu().numpy()
+    else:
+        m_c_flat = m_c_grid.reshape(-1) if m_c_grid.ndim > 1 else m_c_grid
+    
+    grid_nodes_np = grid_nodes.cpu().numpy() if isinstance(grid_nodes, torch.Tensor) else grid_nodes
+    scatter = ax.scatter(
+        grid_nodes_np[:, 0],
+        grid_nodes_np[:, 1],
+        grid_nodes_np[:, 2],
+        c=m_c_flat,
+        cmap='viridis',
+        s=5,
+        alpha=0.3,
+        label='Grid nodes'
+    )
+    
+    cbar = plt.colorbar(scatter, ax=ax, label='m_c value')
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_title(title)
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+    
+    return fig
