@@ -248,6 +248,38 @@ class SDFNetwork(nn.Module):
         
         return sdf
 
+    def train_step(self, train_loader, optimizer, criterion, device='cpu', num_epochs=10, verbose=True):
+        """
+        SDFNetwork 학습 루프 (여러 에폭)
+        Args:
+            train_loader: DataLoader yielding (feature_patch, sdf_gt) tuples
+            optimizer: torch.optim.Optimizer
+            criterion: 손실 함수 (예: nn.MSELoss)
+            device: 학습 기기
+            num_epochs: 학습 에폭 수
+            verbose: 진행 상황 출력 여부
+        Returns:
+            epoch_losses: 에폭별 평균 손실 리스트
+        """
+        self.train()
+        epoch_losses = []
+        for epoch in range(num_epochs):
+            running_loss = 0.0
+            for batch_idx, (feature_patch, sdf_gt) in enumerate(train_loader):
+                feature_patch = feature_patch.to(device)
+                sdf_gt = sdf_gt.to(device)
+                optimizer.zero_grad()
+                output = self.forward(feature_patch)
+                loss = criterion(output.squeeze(-1), sdf_gt)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item() * feature_patch.size(0)
+            avg_loss = running_loss / len(train_loader.dataset)
+            epoch_losses.append(avg_loss)
+            if verbose:
+                print(f"Epoch [{epoch+1}/{num_epochs}] Loss: {avg_loss:.6f}")
+        return epoch_losses
+
 
 # ===========================
 # 3. 통합 파이프라인
