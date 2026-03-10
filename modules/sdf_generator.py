@@ -37,26 +37,26 @@ class SDFGenerator:
             shape_type = np.random.choice(shape_choices)
             obj = None
             
-            p_start = np.random.uniform(-0.3, 0.3, 3)
-            p_end = np.random.uniform(-0.3, 0.3, 3)
+            p_start = np.random.uniform(-0.8, 0.8, 3)
+            p_end = np.random.uniform(-0.8, 0.8, 3)
             
             if shape_type == 'sphere':
-                obj = sphere(np.random.uniform(0.1, 0.4))
+                obj = sphere(np.random.uniform(0.3, 0.7))
             elif shape_type == 'box':
-                obj = box(np.random.uniform(0.1, 0.4, 3))
+                obj = box(np.random.uniform(0.3, 0.7, 3))
             elif shape_type == 'rounded_box':
-                obj = rounded_box(np.random.uniform(0.1, 0.4, 3), np.random.uniform(0.02, 0.1))
+                obj = rounded_box(np.random.uniform(0.3, 0.7, 3), np.random.uniform(0.05, 0.15))
             elif shape_type == 'capped_cylinder':
-                obj = capped_cylinder(p_start, p_end, np.random.uniform(0.05, 0.2))
+                obj = capped_cylinder(p_start, p_end, np.random.uniform(0.15, 0.4))
             elif shape_type == 'capsule':
-                obj = capsule(p_start, p_end, np.random.uniform(0.05, 0.2))
+                obj = capsule(p_start, p_end, np.random.uniform(0.15, 0.4))
             elif shape_type == 'torus':
-                r_major = np.random.uniform(0.2, 0.5)
-                r_minor = np.random.uniform(0.05, 0.15)
+                r_major = np.random.uniform(0.4, 0.8)
+                r_minor = np.random.uniform(0.1, 0.25)
                 if r_minor >= r_major: r_minor = r_major * 0.5
                 obj = torus(r_major, r_minor)
             elif shape_type == 'capped_cone':
-                obj = capped_cone(p_start, p_end, np.random.uniform(0.1, 0.3), np.random.uniform(0.0, 0.2))
+                obj = capped_cone(p_start, p_end, np.random.uniform(0.3, 0.6), np.random.uniform(0.0, 0.4))
     
             if shape_type in ['sphere', 'box', 'rounded_box', 'torus']:
                 angle = np.random.uniform(0, 360)

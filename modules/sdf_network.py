@@ -316,31 +316,45 @@ class SDFReconstruction:
         self.network = SDFNetwork().to(device)
     
     def extract_local_features(self, m_c_grid: torch.Tensor, 
+                              center_idx: int,
                               grid_shape: tuple,
                               patch_size: int = 8) -> torch.Tensor:
         """
-        중심 노드 주변의 8×8×8 패치 추출
-        
-        Args:
-            m_c_grid: (Gx, Gy, Gz) 3D 그리드 특징값
-            center_idx: 중심 노드 선형 인덱스
-            grid_shape: (Gx, Gy, Gz) 그리드 크기
-            patch_size: 패치 크기 (기본값 8)
-        
-        Returns:
-            patch: (1, 1, 8, 8, 8) 패치 특징값
+        중심 노드 선형 인덱스를 받아서 주변 8×8×8 패치 추출 (패딩 포함)
         """
-        cx, cy, cz = center_3d_idx
+        c_idx = np.unravel_index(center_idx, grid_shape)
+        half_size = patch_size // 2
         
-        # 패딩된 그리드에서는 cx, cy, cz가 곧 패치의 시작 인덱스가 됨
-        patch = padded_m_c_grid[
-            cx : cx + patch_size,
-            cy : cy + patch_size,
-            cz : cz + patch_size
+        start_idx = [c - half_size for c in c_idx]
+        end_idx = [c + half_size for c in c_idx]
+        
+        grid_start = [max(0, s) for s in start_idx]
+        grid_end = [min(g, e) for g, e in zip(grid_shape, end_idx)]
+        
+        # 1. 원본 그리드에서 유효한 부분 자르기
+        patch = m_c_grid[
+            grid_start[0]:grid_end[0],
+            grid_start[1]:grid_end[1],
+            grid_start[2]:grid_end[2]
         ]
         
-        # (1, 1, 8, 8, 8) 형태로 차원 확장 (Batch, Channel 추가)
-        return patch.unsqueeze(0).unsqueeze(0)
+        # 2. 패딩 계산 (영역 밖으로 나간 양)
+        pad_before = [max(0, -s) for s in start_idx]
+        pad_after = [max(0, e - g) for e, g in zip(end_idx, grid_shape)]
+        
+        # 3. F.pad를 사용하기 위해 (뒤집힌 순서로) 패딩 나열
+        # PyTorch F.pad는 (마지막차원_앞, 마지막차원_뒤, 그앞차원_앞, 그앞차원_뒤, 처음차원_앞, 처음차원_뒤)
+        padding_tuple = (
+            pad_before[2], pad_after[2], 
+            pad_before[1], pad_after[1], 
+            pad_before[0], pad_after[0]
+        )
+        
+        # 4. 패딩 적용 (크기를 강제로 8x8x8로 만듦)
+        padded_patch = F.pad(patch, padding_tuple, mode='constant', value=0.0)
+        
+        # 5. 차원 확장: (8, 8, 8) -> (1, 1, 8, 8, 8) [Batch=1, Channel=1]
+        return padded_patch.unsqueeze(0).unsqueeze(0)
     
     def preprocess(self, particle_positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, tuple]:
         """

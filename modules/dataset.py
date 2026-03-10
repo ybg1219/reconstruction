@@ -64,37 +64,37 @@ class SDFDataset(Dataset):
         3D 그리드에서 (patch_size, patch_size, patch_size) 크기로 패치를 자릅니다.
         가장자리(Boundary)에 위치한 노드일 경우 Zero Padding을 적용합니다.
         """
-        start_idx = [max(0, c - self.half_size) for c in center_3d_idx]
-        end_idx = [min(s, c + self.half_size) for s, c in zip(self.grid_shape, start_idx)]
+        start_idx = [c - self.half_size for c in center_3d_idx]
+        end_idx = [c + self.half_size for c in center_3d_idx]
         
-        # 모자란 길이 보정 단계 (예: 끝자락이라 8칸이 안 될 경우 앞/뒤 공간 연장 시도)
-        # 하지만 논문과 물리적으로 완벽한 형태를 위해 Zero padding을 명확하게 둡니다.
-        end_idx = [e + (self.patch_size - (e - s)) for e, s in zip(end_idx, start_idx)]
-        end_idx = [min(s, e) for s, e in zip(self.grid_shape, end_idx)]
+        # 1. 그리드를 벗어나는 '패딩 필요량' 계산
+        pad_before = [max(0, -s) for s in start_idx]
+        pad_after = [max(0, e - g) for e, g in zip(end_idx, self.grid_shape)]
         
-        # 영역 슬라이싱
+        # 2. 실제 그리드 내부에서 안전하게 잘라낼 좌표
+        grid_start = [max(0, s) for s in start_idx]
+        grid_end = [min(g, e) for g, e in zip(self.grid_shape, end_idx)]
+        
+        # 3. 안전 영역 잘라내기
         patch = grid[
-            start_idx[0]:end_idx[0],
-            start_idx[1]:end_idx[1],
-            start_idx[2]:end_idx[2]
+            grid_start[0]:grid_end[0],
+            grid_start[1]:grid_end[1],
+            grid_start[2]:grid_end[2]
         ]
         
-        # 패딩 배열 생성 및 삽입 (빈 공간은 0으로 채워짐)
-        padded_patch = np.zeros((self.patch_size, self.patch_size, self.patch_size), dtype=np.float32)
-        
-        # 실제 데이터가 들어가는 공간(인덱스) 계산
-        start_pad = [self.half_size - (c - s) for s, c in zip(start_idx, center_3d_idx)]
-        
-        # numpy indexing을 통해 알맞은 구역에 패치 삽입
-        padded_patch[
-            start_pad[0] : start_pad[0] + patch.shape[0],
-            start_pad[1] : start_pad[1] + patch.shape[1],
-            start_pad[2] : start_pad[2] + patch.shape[2]
-        ] = patch
+        # 4. 모자란 부분(그리드 바깥)을 0으로 채우기 (np.pad 사용)
+        padded_patch = np.pad(
+            patch, 
+            pad_width=(
+                (pad_before[0], pad_after[0]),
+                (pad_before[1], pad_after[1]),
+                (pad_before[2], pad_after[2])
+            ),
+            mode='constant',
+            constant_values=0
+        )
         
         # 모델 입력 포맷 형태: (Channel=1, Depth, Height, Width)
-        # return 시 Data Loader가 Batch 차원을 추가하므로 (1, 8, 8, 8)로 리턴해야
-        # 최종적으로 (Batch, 1, 8, 8, 8) 이 됩니다.
         return np.expand_dims(padded_patch, axis=0)
 
     def __getitem__(self, idx):
