@@ -226,7 +226,7 @@ def visualize_feature_grid(m_c_grid: torch.Tensor,
     그리드 특징값(m_c) 시각화
     
     Args:
-        m_c_grid: (Gx, Gy, Gz) 3D 그리드 특징값
+        m_c_grid: (G,) 1D 배열 형태의 특징값
         grid_nodes: (G, 3) 그리드 노드 좌표
         title: 그래프 제목
         figsize: 그림 크기
@@ -237,16 +237,30 @@ def visualize_feature_grid(m_c_grid: torch.Tensor,
     fig = plt.figure(figsize=figsize)
     ax = fig.add_subplot(111, projection='3d')
     
-    # m_c 값에 따라 색상 설정
-    m_c_flat = m_c_grid.reshape(-1).cpu().numpy() if isinstance(m_c_grid, torch.Tensor) else m_c_grid.reshape(-1)
+    # 텐서를 numpy 배열로 변환
+    m_c_flat = m_c_grid.cpu().numpy() if isinstance(m_c_grid, torch.Tensor) else m_c_grid
+    m_c_flat = m_c_flat.flatten()
+    
+    grid_np = grid_nodes.cpu().numpy() if isinstance(grid_nodes, torch.Tensor) else grid_nodes
+    
+    # 길이 보정: 데이터 개수가 일치하지 않는 경우를 대비한 안전 로직 (파티클 기반의 동적 추출일 때)
+    # min_len = min(len(m_c_flat), len(grid_np))
+    # m_c_flat = m_c_flat[:min_len]
+    # grid_np = grid_np[:min_len]
+
+    mask = m_c_flat > 1e-5  # 값이 아주 작은 노이즈와 0을 걸러냅니다.
+    
+    m_c_filtered = m_c_flat[mask]
+    grid_filtered = grid_np[mask]
+    
     scatter = ax.scatter(
-        grid_nodes[:, 0].cpu().numpy() if isinstance(grid_nodes, torch.Tensor) else grid_nodes[:, 0],
-        grid_nodes[:, 1].cpu().numpy() if isinstance(grid_nodes, torch.Tensor) else grid_nodes[:, 1],
-        grid_nodes[:, 2].cpu().numpy() if isinstance(grid_nodes, torch.Tensor) else grid_nodes[:, 2],
-        c=m_c_flat,
+        grid_filtered[:, 0],
+        grid_filtered[:, 1],
+        grid_filtered[:, 2],
+        c=m_c_filtered,
         cmap='viridis',
         s=10,
-        alpha=0.6
+        alpha=0.4
     )
     
     cbar = plt.colorbar(scatter, ax=ax, label='m_c value')
@@ -340,12 +354,12 @@ def visualize_particles_and_features(particles: torch.Tensor,
         grid_nodes_np[:, 2],
         c=m_c_flat,
         cmap='viridis',
-        s=5,
-        alpha=0.3,
+        s=3,
+        alpha=0.1,
         label='Grid nodes'
     )
     
-    cbar = plt.colorbar(scatter, ax=ax, label='m_c value')
+    plt.colorbar(scatter, ax=ax, label='m_c value')
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')

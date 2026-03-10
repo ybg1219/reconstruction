@@ -83,14 +83,20 @@ class FeatureConstruction:
             grid_nodes: (G, 3) 그리드 노드 좌표
             grid_shape: (Gx, Gy, Gz) 그리드 크기
         """
-        min_coords = particle_positions.min(dim=0)[0] - self.dx * 2
-        max_coords = particle_positions.max(dim=0)[0] + self.dx * 2
+        # 파티클 위치 기반 그리드 생성
+        # min_coords = particle_positions.min(dim=0)[0] - self.dx * 2
+        # max_coords = particle_positions.max(dim=0)[0] + self.dx * 2
+
+        # 고정 범위 그리드 생성
+        domain_size = 2.0  # config.domain_size 와 동일하게 맞추세요
+        min_bound = -domain_size / 2.0
+        max_bound = domain_size / 2.0
         
         # 그리드 생성
-        x = torch.arange(min_coords[0], max_coords[0], self.dx, device=particle_positions.device)
-        y = torch.arange(min_coords[1], max_coords[1], self.dx, device=particle_positions.device)
-        z = torch.arange(min_coords[2], max_coords[2], self.dx, device=particle_positions.device)
-        
+        x = torch.arange(min_bound, max_bound + 1e-5, self.dx, device=particle_positions.device)
+        y = torch.arange(min_bound, max_bound + 1e-5, self.dx, device=particle_positions.device)
+        z = torch.arange(min_bound, max_bound + 1e-5, self.dx, device=particle_positions.device)
+
         grid_nodes = torch.stack(torch.meshgrid(x, y, z, indexing='ij'), dim=-1)
         grid_shape = grid_nodes.shape[:3]
         grid_nodes = grid_nodes.reshape(-1, 3)
@@ -98,14 +104,15 @@ class FeatureConstruction:
         return grid_nodes, grid_shape
     
     def compute_grid_features(self, particle_positions: torch.Tensor, 
-                             grid_nodes: torch.Tensor) -> torch.Tensor:
+                             grid_nodes: torch.Tensor, chunk_size: int = 10000) -> torch.Tensor:
         """
-        그리드 노드 특징값 계산
+        그리드 노드 특징값 계산 (메모리 절약을 위해 Chunk 단위 처리)
         m_c = Σ_{p ∈ N_c} (1/ρ_p) * W(||x_c - x_p||, R)
         
         Args:
             particle_positions: (N, 3) 파티클 좌표
             grid_nodes: (G, 3) 그리드 노드 좌표
+            chunk_size: 한 번에 처리할 노드 개수 (기본 10000개)
         
         Returns:
             m_c: (G,) 그리드 특징값
@@ -114,18 +121,27 @@ class FeatureConstruction:
         rho_p = self.compute_particle_density(particle_positions)
         rho_p = torch.clamp(rho_p, min=1e-6)  # 수치 안정성
         
-        # 그리드-파티클 거리 계산 (G, N)
-        distances = torch.cdist(grid_nodes, particle_positions, p=2)
+        num_nodes = grid_nodes.shape[0]
+        m_c_list = []
         
-        # 커널 값 계산 (G, N)
-        kernel_values = self.poly6_kernel(distances, self.R)
-        
-        # 1/ρ_p 적용 (G, N)
-        weighted_kernel = kernel_values / rho_p.unsqueeze(0)
-        
-        # m_c 계산 (G,)
-        m_c = weighted_kernel.sum(dim=1)
-        
+        # 메모리 초과를 방지하기 위해 노드를 chunk 단위로 처리
+        for i in range(0, num_nodes, chunk_size):
+            chunk_nodes = grid_nodes[i:i+chunk_size]
+            
+            # 그리드-파티클 거리 계산 (Chunk, N)
+            distances = torch.cdist(chunk_nodes, particle_positions, p=2)
+            
+            # 커널 값 계산 (Chunk, N)
+            kernel_values = self.poly6_kernel(distances, self.R)
+            
+            # 1/ρ_p 적용 (Chunk, N)
+            weighted_kernel = kernel_values / rho_p.unsqueeze(0)
+            
+            # m_c 계산 (Chunk,)
+            m_c_chunk = weighted_kernel.sum(dim=1)
+            m_c_list.append(m_c_chunk)
+            
+        m_c = torch.cat(m_c_list, dim=0)
         return m_c
     
     def __call__(self, particle_positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, tuple]:
@@ -300,7 +316,6 @@ class SDFReconstruction:
         self.network = SDFNetwork().to(device)
     
     def extract_local_features(self, m_c_grid: torch.Tensor, 
-                              center_idx: int, 
                               grid_shape: tuple,
                               patch_size: int = 8) -> torch.Tensor:
         """
@@ -315,32 +330,17 @@ class SDFReconstruction:
         Returns:
             patch: (1, 1, 8, 8, 8) 패치 특징값
         """
-        # 선형 인덱스를 3D 인덱스로 변환
-        center_3d_idx = np.unravel_index(center_idx, grid_shape)
+        cx, cy, cz = center_3d_idx
         
-        # 패치 범위 계산
-        half_size = patch_size // 2
-        start_idx = [max(0, c - half_size) for c in center_3d_idx]
-        end_idx = [min(s, c + half_size) for s, c in zip(grid_shape, start_idx)]
-        end_idx = [e + (patch_size - (e - s)) for e, s in zip(end_idx, start_idx)]
-        end_idx = [min(s, e) for s, e in zip(grid_shape, end_idx)]
-        
-        # 패치 추출
-        patch = m_c_grid[
-            start_idx[0]:end_idx[0],
-            start_idx[1]:end_idx[1],
-            start_idx[2]:end_idx[2]
+        # 패딩된 그리드에서는 cx, cy, cz가 곧 패치의 시작 인덱스가 됨
+        patch = padded_m_c_grid[
+            cx : cx + patch_size,
+            cy : cy + patch_size,
+            cz : cz + patch_size
         ]
         
-        # 패치를 8×8×8로 패딩
-        padded_patch = torch.zeros(
-            patch_size, patch_size, patch_size,
-            device=m_c_grid.device,
-            dtype=m_c_grid.dtype
-        )
-        padded_patch[:patch.shape[0], :patch.shape[1], :patch.shape[2]] = patch
-        
-        return padded_patch.unsqueeze(0).unsqueeze(0)
+        # (1, 1, 8, 8, 8) 형태로 차원 확장 (Batch, Channel 추가)
+        return patch.unsqueeze(0).unsqueeze(0)
     
     def preprocess(self, particle_positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, tuple]:
         """
@@ -365,43 +365,45 @@ class SDFReconstruction:
         return m_c_grid, grid_nodes, grid_shape
     
     def forward(self, particle_positions: torch.Tensor, 
-                num_inference_nodes: Optional[int] = None,
-                batch_size: int = 32) -> Tuple[torch.Tensor, torch.Tensor]:
+                batch_size: int = 512) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
         """
-        전체 파이프라인: 파티클 -> SDF 값
-        
-        Args:
-            particle_positions: (N, 3) 파티클 좌표
-            num_inference_nodes: 추론할 노드 개수 (None이면 전체)
-            batch_size: 배치 크기
-        
-        Returns:
-            grid_nodes: (G, 3) 그리드 노드 좌표
-            sdf_values: (G,) SDF 값
-            m_c_grid: (Gx, Gy, Gz) 특징값 그리드
-            grid_shape: 그리드 크기
+        [수정됨] 전체 파이프라인: 파티클 -> SDF 값
         """
-        # 1단계: 전처리
+        # 1. 전처리 (m_c 그리드 계산)
         m_c_grid, grid_nodes, grid_shape = self.preprocess(particle_positions)
         
-        # 2단계: SDF 추론
+        # 2. 전체 그리드에 패딩 적용 (8x8x8 패치 추출 시 경계 에러 방지용)
+        # 사방으로 4칸(patch_size // 2)씩 0으로 채움
+        pad_size = 4
+        padded_m_c_grid = F.pad(m_c_grid, (pad_size, pad_size, pad_size, pad_size, pad_size, pad_size), mode='constant', value=0)
+        
         num_nodes = grid_nodes.shape[0]
         sdf_values = torch.zeros(num_nodes, device=self.device)
         
-        if num_inference_nodes is None:
-            num_inference_nodes = min(1000, num_nodes)
-        
+        print(f"총 {num_nodes}개의 그리드 노드에 대해 SDF 추론을 시작합니다...")
+
+        # 3. 배치 단위로 잘라서 3D CNN 통과
+        self.network.eval() # 추론 모드로 전환
         with torch.no_grad():
-            for i in range(0, num_inference_nodes, batch_size):
-                batch_end = min(i + batch_size, num_inference_nodes)
+            for i in range(0, num_nodes, batch_size):
+                batch_end = min(i + batch_size, num_nodes)
                 batch_patches = []
                 
+                # 배치 내의 노드들에 대해 패치 긁어오기
                 for idx in range(i, batch_end):
-                    patch = self.extract_local_features(m_c_grid, idx, grid_shape)
+                    # 1차원 인덱스를 3차원 (x, y, z) 인덱스로 변환
+                    c_idx = np.unravel_index(idx, grid_shape)
+                    patch = self.extract_local_features(padded_m_c_grid, c_idx, patch_size=8)
                     batch_patches.append(patch)
                 
-                batch_patches = torch.cat(batch_patches, dim=0).to(self.device)
-                batch_sdf = self.network(batch_patches)
+                # (Batch, 1, 8, 8, 8) 형태로 결합
+                batch_tensor = torch.cat(batch_patches, dim=0).to(self.device)
+                
+                # 모델 통과
+                batch_sdf = self.network(batch_tensor)
                 sdf_values[i:batch_end] = batch_sdf.squeeze(-1)
-        
+                
+                if (i % (batch_size * 10)) == 0:
+                    print(f"추론 진행률: {i}/{num_nodes} ({(i/num_nodes)*100:.1f}%)")
+
         return grid_nodes, sdf_values, m_c_grid, grid_shape
