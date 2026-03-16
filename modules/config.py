@@ -6,7 +6,7 @@ class Config:
         self.resolution = 64
         
         # 2. 파티클 샘플링 설정
-        self.num_particles = 5000
+        self.num_particles = 40000
         
         # 3. 모델 네트워크 설정
         self.patch_size = 8
