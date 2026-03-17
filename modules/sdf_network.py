@@ -17,9 +17,11 @@ from mpl_toolkits.mplot3d import Axes3D
 # ===========================
 # 1. 전처리 모듈: Feature Construction
 # ===========================
-
 class FeatureConstruction:
-    """파티클 위치에서 그리드 특징값(m_c) 계산"""
+    """
+    파티클 위치에서 그리드 특징값(m_c) 계산
+    Splatting (Scatter-Add) 기법을 사용
+    """
     
     def __init__(self, dx: float = 0.1, device: str = 'cpu'):
         """
@@ -30,6 +32,9 @@ class FeatureConstruction:
         self.dx = dx
         self.R = 3.0 * dx  # 커널 반경
         self.device = device
+        self.domain_size = 2.0  # 전역 도메인 크기
+        self.min_bound = -self.domain_size / 2.0
+        self.max_bound = self.domain_size / 2.0
         
     def poly6_kernel(self, r: torch.Tensor, R: float) -> torch.Tensor:
         """
@@ -44,11 +49,11 @@ class FeatureConstruction:
             커널 값 (텐서)
         """
         coeff = 315.0 / (64.0 * np.pi * R**9)
-        mask = (r < R).float()
+        # r > R 이면 R^2 - r^2 가 음수가 되므로 clamp(min=0.0)에서 이미 0으로 처리됩니다.
         value = coeff * torch.clamp(R**2 - r**2, min=0.0)**3
-        return value * mask
+        return value
     
-    def compute_particle_density(self, particle_positions: torch.Tensor) -> torch.Tensor:
+    def compute_particle_density(self, particle_positions: torch.Tensor, chunk_size: int = 1000) -> torch.Tensor:
         """
         각 파티클의 밀도 계산
         ρ_p = Σ_{q ∈ N_p} W(||x_p - x_q||, R)
@@ -60,16 +65,18 @@ class FeatureConstruction:
             rho_p: (N,) 밀도 값
         """
         N = particle_positions.shape[0]
+        rho_p = torch.zeros(N, device=self.device)
         
-        # 모든 파티클 쌍에 대해 거리 계산
-        distances = torch.cdist(particle_positions, particle_positions, p=2)
-        
-        # 커널 값 계산
-        kernel_values = self.poly6_kernel(distances, self.R)
-        
-        # 각 파티클별 밀도 합산
-        rho_p = kernel_values.sum(dim=1)
-        
+        # N x N 거리를 한 번에 구하면 터지므로, 파티클을 5000개씩 잘라서 전체와 비교
+        for i in range(0, N, chunk_size):
+            end = min(i + chunk_size, N)
+            chunk = particle_positions[i:end]
+            
+            # (Chunk, N) 거리 행렬 -> 4090 메모리로는 아주 여유롭게 처리 가능
+            distances = torch.cdist(chunk, particle_positions, p=2)
+            kernel_values = self.poly6_kernel(distances, self.R)
+            rho_p[i:end] = kernel_values.sum(dim=1)
+            
         return rho_p
     
     def create_grid(self, particle_positions: torch.Tensor) -> Tuple[torch.Tensor, tuple]:
@@ -83,19 +90,9 @@ class FeatureConstruction:
             grid_nodes: (G, 3) 그리드 노드 좌표
             grid_shape: (Gx, Gy, Gz) 그리드 크기
         """
-        # 파티클 위치 기반 그리드 생성
-        # min_coords = particle_positions.min(dim=0)[0] - self.dx * 2
-        # max_coords = particle_positions.max(dim=0)[0] + self.dx * 2
-
-        # 고정 범위 그리드 생성
-        domain_size = 2.0  # config.domain_size 와 동일하게 맞추세요
-        min_bound = -domain_size / 2.0
-        max_bound = domain_size / 2.0
-        
-        # 그리드 생성
-        x = torch.arange(min_bound, max_bound + 1e-5, self.dx, device=particle_positions.device)
-        y = torch.arange(min_bound, max_bound + 1e-5, self.dx, device=particle_positions.device)
-        z = torch.arange(min_bound, max_bound + 1e-5, self.dx, device=particle_positions.device)
+        x = torch.arange(self.min_bound, self.max_bound + 1e-5, self.dx, device=self.device)
+        y = torch.arange(self.min_bound, self.max_bound + 1e-5, self.dx, device=self.device)
+        z = torch.arange(self.min_bound, self.max_bound + 1e-5, self.dx, device=self.device)
 
         grid_nodes = torch.stack(torch.meshgrid(x, y, z, indexing='ij'), dim=-1)
         grid_shape = grid_nodes.shape[:3]
@@ -104,7 +101,7 @@ class FeatureConstruction:
         return grid_nodes, grid_shape
     
     def compute_grid_features(self, particle_positions: torch.Tensor, 
-                             grid_nodes: torch.Tensor, chunk_size: int = 10000) -> torch.Tensor:
+                             grid_shape: tuple, chunk_size: int = 20000) -> torch.Tensor:
         """
         그리드 노드 특징값 계산 (메모리 절약을 위해 Chunk 단위 처리)
         m_c = Σ_{p ∈ N_c} (1/ρ_p) * W(||x_c - x_p||, R)
@@ -119,30 +116,66 @@ class FeatureConstruction:
         """
         # 파티클 밀도 계산
         rho_p = self.compute_particle_density(particle_positions)
-        rho_p = torch.clamp(rho_p, min=1e-6)  # 수치 안정성
+        rho_p = torch.clamp(rho_p, min=1e-6)
         
-        num_nodes = grid_nodes.shape[0]
-        m_c_list = []
+        # 1. 3D m_c 그리드 빈 도화지 생성
+        m_c_grid = torch.zeros(grid_shape, device=self.device)
         
-        # 메모리 초과를 방지하기 위해 노드를 chunk 단위로 처리
-        for i in range(0, num_nodes, chunk_size):
-            chunk_nodes = grid_nodes[i:i+chunk_size]
+        # 2. 커널 반경(R)이 닿는 격자 칸 수 계산 (R = 3*dx 이므로 3칸)
+        rad_cells = int(np.ceil(self.R / self.dx)) 
+        
+        # 3. 파티클 주변의 국소 그리드 템플릿(343개 오프셋) 생성
+        offsets = torch.arange(-rad_cells, rad_cells + 1, device=self.device)
+        ox, oy, oz = torch.meshgrid(offsets, offsets, offsets, indexing='ij')
+        local_idx = torch.stack([ox, oy, oz], dim=-1).view(-1, 3)  # (343, 3)
+        
+        N = particle_positions.shape[0]
+        
+        # 메모리 효율을 위해 파티클도 Chunk 단위로 나누어 스플래팅
+        for i in range(0, N, chunk_size):
+            end = min(i + chunk_size, N)
+            p_chunk = particle_positions[i:end]
+            rho_chunk = rho_p[i:end]
             
-            # 그리드-파티클 거리 계산 (Chunk, N)
-            distances = torch.cdist(chunk_nodes, particle_positions, p=2)
+            # 파티클이 위치한 가장 가까운 '중앙 그리드 인덱스' 역산
+            idx_float = (p_chunk - self.min_bound) / self.dx
+            idx_base = torch.round(idx_float).long()  # (Chunk, 3)
             
-            # 커널 값 계산 (Chunk, N)
-            kernel_values = self.poly6_kernel(distances, self.R)
+            # 중앙 인덱스에 343개의 템플릿 오프셋을 더해 '주변 이웃 인덱스들' 계산
+            # (Chunk, 1, 3) + (1, 343, 3) = (Chunk, 343, 3)
+            neighbor_idx = idx_base.unsqueeze(1) + local_idx.unsqueeze(0)
             
-            # 1/ρ_p 적용 (Chunk, N)
-            weighted_kernel = kernel_values / rho_p.unsqueeze(0)
+            # 그리드 영역 밖으로 삐져나간 인덱스 필터링 (마스킹)
+            valid_x = (neighbor_idx[..., 0] >= 0) & (neighbor_idx[..., 0] < grid_shape[0])
+            valid_y = (neighbor_idx[..., 1] >= 0) & (neighbor_idx[..., 1] < grid_shape[1])
+            valid_z = (neighbor_idx[..., 2] >= 0) & (neighbor_idx[..., 2] < grid_shape[2])
+            valid_mask = valid_x & valid_y & valid_z  # (Chunk, 343)
             
-            # m_c 계산 (Chunk,)
-            m_c_chunk = weighted_kernel.sum(dim=1)
-            m_c_list.append(m_c_chunk)
+            # 실제 그리드 노드의 월드 좌표(x, y, z) 계산
+            neighbor_pos = self.min_bound + neighbor_idx.float() * self.dx
             
-        m_c = torch.cat(m_c_list, dim=0)
-        return m_c
+            # 파티클과 주변 343개 이웃 간의 정확한 유클리디안 거리 계산
+            diff = neighbor_pos - p_chunk.unsqueeze(1)
+            dist = torch.norm(diff, dim=-1)  # (Chunk, 343)
+            
+            # 커널 값 계산 및 밀도(rho) 적용
+            kernel_val = self.poly6_kernel(dist, self.R)
+            weighted_kernel = kernel_val / rho_chunk.unsqueeze(1)
+            
+            # 유효한 인덱스에만 값을 남기고 밖으로 삐져나간 곳은 0으로 처리
+            valid_weights = weighted_kernel[valid_mask]
+            
+            # PyTorch put_ 연산을 위해 (x, y, z) 3D 인덱스를 1D 평면 인덱스로 쫙 폅니다.
+            flat_indices = (neighbor_idx[..., 0] * grid_shape[1] * grid_shape[2] +
+                            neighbor_idx[..., 1] * grid_shape[2] +
+                            neighbor_idx[..., 2])
+            valid_flat_indices = flat_indices[valid_mask]
+            
+            # 🚨 [핵심] 빈 도화지(m_c_grid)에 계산된 특징값들을 한 번에 더해줍니다 (Splatting!)
+            m_c_grid.put_(valid_flat_indices, valid_weights, accumulate=True)
+            
+        # 기존 파이프라인(1D 출력)과 호환되도록 평탄화하여 리턴
+        return m_c_grid.view(-1)
     
     def __call__(self, particle_positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, tuple]:
         """
@@ -158,11 +191,11 @@ class FeatureConstruction:
         """
         particle_positions = particle_positions.float()
         
-        # 그리드 생성
+        # 그리드 생성 (좌표 구조만 생성)
         grid_nodes, grid_shape = self.create_grid(particle_positions)
         
-        # 그리드 특징값 계산
-        m_c = self.compute_grid_features(particle_positions, grid_nodes)
+        # [수정] 그리드 좌표를 넘기지 않고 shape만 넘겨 내부에서 Splatting 처리
+        m_c = self.compute_grid_features(particle_positions, grid_shape)
         
         return grid_nodes, m_c, grid_shape
 
