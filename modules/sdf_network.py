@@ -12,6 +12,20 @@ import numpy as np
 from typing import Tuple, Optional
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+"""
+3D SDF 재구성 네트워크 모듈
+- Poly6 커널 기반 특징값(m_c) 계산
+- 3D CNN 기반 SDF 예측 모델
+- 전체 파이프라인 통합
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from typing import Tuple, Optional
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 
 # ===========================
@@ -35,6 +49,10 @@ class FeatureConstruction:
         self.domain_size = 2.0  # 전역 도메인 크기
         self.min_bound = -self.domain_size / 2.0
         self.max_bound = self.domain_size / 2.0
+
+        # 공간 해싱을 위한 격자 크기 및 차원 설정
+        self.cell_size = self.R * 0.9
+        self.grid_dims = int(np.ceil(self.domain_size / self.cell_size))
         
     def poly6_kernel(self, r: torch.Tensor, R: float) -> torch.Tensor:
         """
@@ -52,74 +70,149 @@ class FeatureConstruction:
         # r > R 이면 R^2 - r^2 가 음수가 되므로 clamp(min=0.0)에서 이미 0으로 처리됩니다.
         value = coeff * torch.clamp(R**2 - r**2, min=0.0)**3
         return value
-    
-    def compute_particle_density(self, particle_positions: torch.Tensor, chunk_size: int = 1000) -> torch.Tensor:
+
+    # ---------------------------------------------------------
+    # 내부 최적화 유틸리티 (공간 해싱 및 VRAM 관리)
+    # ---------------------------------------------------------
+    def _spatial_hash_and_sort(self, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """파티클 해싱 및 공간 정렬"""
+        cell_coords = torch.floor((positions - self.min_bound) / self.cell_size).long()
+        cell_coords = torch.clamp(cell_coords, 0, self.grid_dims - 1)
+        
+        # 1D 해시 키 (z축, y축, x축 순 평탄화)
+        hash_keys = (cell_coords[:, 0] * (self.grid_dims ** 2) + 
+                     cell_coords[:, 1] * self.grid_dims + 
+                     cell_coords[:, 2])
+        
+        sorted_keys, sorted_indices = torch.sort(hash_keys)
+        sorted_pos = positions[sorted_indices]
+        return sorted_pos, sorted_keys
+
+    def _build_cell_offsets(self, sorted_keys: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """bincount와 cumsum을 이용한 O(1) 셀 슬라이싱 오프셋 구축"""
+        total_cells = self.grid_dims ** 3
+        counts = torch.bincount(sorted_keys, minlength=total_cells)
+        end_indices = torch.cumsum(counts, dim=0)
+        start_indices = end_indices - counts
+        return start_indices, end_indices
+
+    def _compute_density_hashed(self, sorted_pos: torch.Tensor, sorted_keys: torch.Tensor, 
+                                start_indices: torch.Tensor, end_indices: torch.Tensor, 
+                                chunk_size: int = 10000) -> torch.Tensor:
+        """3단계: 27방향 이웃 탐색 및 최종 밀도 측정 (OOM 방지를 위한 Chunk 처리 포함)"""
+        N = sorted_pos.shape[0]
+        total_cells = self.grid_dims ** 3
+        rho_p = torch.zeros(N, device=self.device)
+        
+        counts = end_indices - start_indices
+        max_p_per_cell = counts.max().item()
+        
+        if max_p_per_cell == 0:
+            return rho_p
+            
+        particle_idx = torch.arange(N, device=self.device)
+        rank_in_cell = particle_idx - start_indices[sorted_keys]
+        
+        cell_particle_idx = torch.zeros((total_cells, max_p_per_cell), dtype=torch.long, device=self.device)
+        cell_particle_idx[sorted_keys, rank_in_cell] = particle_idx
+        
+        cell_mask = torch.arange(max_p_per_cell, device=self.device).unsqueeze(0) < counts.unsqueeze(1)
+        
+        offsets = torch.tensor([-1, 0, 1], device=self.device)
+        ox, oy, oz = torch.meshgrid(offsets, offsets, offsets, indexing='ij')
+        neighbor_offsets = torch.stack([ox, oy, oz], dim=-1).view(-1, 3) 
+        
+        # 메모리 터짐 방지를 위한 Chunk 루프 복구
+        for i in range(0, N, chunk_size):
+            end = min(i + chunk_size, N)
+            p_chunk = sorted_pos[i:end]
+            
+            cell_coords = torch.floor((p_chunk - self.min_bound) / self.cell_size).long()
+            
+            neighbor_coords = cell_coords.unsqueeze(1) + neighbor_offsets.unsqueeze(0)
+            valid_cells_mask = ((neighbor_coords >= 0) & (neighbor_coords < self.grid_dims)).all(dim=-1)
+            neighbor_coords = neighbor_coords.clamp(0, self.grid_dims - 1)
+            
+            neighbor_keys = (neighbor_coords[..., 0] * (self.grid_dims ** 2) + 
+                             neighbor_coords[..., 1] * self.grid_dims + 
+                             neighbor_coords[..., 2])
+                             
+            gathered_indices = cell_particle_idx[neighbor_keys]
+            gathered_masks = cell_mask[neighbor_keys] & valid_cells_mask.unsqueeze(-1)
+            
+            neighbor_pos = sorted_pos[gathered_indices] 
+            diff = neighbor_pos - p_chunk.view(-1, 1, 1, 3)
+            dist = torch.norm(diff, dim=-1)
+            
+            dist = torch.where(gathered_masks, dist, torch.tensor(self.R + 1.0, device=self.device))
+            
+            kernel_val = self.poly6_kernel(dist, self.R)
+            rho_p[i:end] = kernel_val.sum(dim=(1, 2))
+            
+        return rho_p
+
+    # ---------------------------------------------------------
+    # 메인 파이프라인
+    # ---------------------------------------------------------
+    def compute_particle_density(self, sorted_positions: torch.Tensor, 
+                                 sorted_keys: torch.Tensor, 
+                                 start_indices: torch.Tensor, 
+                                 end_indices: torch.Tensor) -> torch.Tensor:
         """
         각 파티클의 밀도 계산
         ρ_p = Σ_{q ∈ N_p} W(||x_p - x_q||, R)
         
         Args:
-            particle_positions: (N, 3) 파티클 좌표
+            sorted_positions: (N, 3) 정렬된 파티클 좌표
         
         Returns:
             rho_p: (N,) 밀도 값
         """
-        N = particle_positions.shape[0]
-        rho_p = torch.zeros(N, device=self.device)
-        
-        # N x N 거리를 한 번에 구하면 터지므로, 파티클을 5000개씩 잘라서 전체와 비교
-        for i in range(0, N, chunk_size):
-            end = min(i + chunk_size, N)
-            chunk = particle_positions[i:end]
-            
-            # (Chunk, N) 거리 행렬 -> 4090 메모리로는 아주 여유롭게 처리 가능
-            distances = torch.cdist(chunk, particle_positions, p=2)
-            kernel_values = self.poly6_kernel(distances, self.R)
-            rho_p[i:end] = kernel_values.sum(dim=1)
-            
-        return rho_p
+        if sorted_positions.shape[0] == 0:
+            return torch.zeros(0, device=self.device)
+        return self._compute_density_hashed(sorted_positions, sorted_keys, start_indices, end_indices)
     
-    def create_grid(self, particle_positions: torch.Tensor) -> Tuple[torch.Tensor, tuple]:
+    def create_grid(self) -> Tuple[torch.Tensor, tuple]:
         """
         파티클 위치 기반 그리드 생성
-        
-        Args:
-            particle_positions: (N, 3) 파티클 좌표
         
         Returns:
             grid_nodes: (G, 3) 그리드 노드 좌표
             grid_shape: (Gx, Gy, Gz) 그리드 크기
         """
-        x = torch.arange(self.min_bound, self.max_bound + 1e-5, self.dx, device=self.device)
-        y = torch.arange(self.min_bound, self.max_bound + 1e-5, self.dx, device=self.device)
-        z = torch.arange(self.min_bound, self.max_bound + 1e-5, self.dx, device=self.device)
+        # 부동소수점 오차 방지를 위해 linspace 사용
+        steps = int(np.round((self.max_bound - self.min_bound) / self.dx)) + 1
+        
+        x = torch.linspace(self.min_bound, self.max_bound, steps, device=self.device)
+        y = torch.linspace(self.min_bound, self.max_bound, steps, device=self.device)
+        z = torch.linspace(self.min_bound, self.max_bound, steps, device=self.device)
 
         grid_nodes = torch.stack(torch.meshgrid(x, y, z, indexing='ij'), dim=-1)
-        grid_shape = grid_nodes.shape[:3]
+        grid_shape = (steps, steps, steps)
         grid_nodes = grid_nodes.reshape(-1, 3)
         
         return grid_nodes, grid_shape
     
-    def compute_grid_features(self, particle_positions: torch.Tensor, 
-                             grid_shape: tuple, chunk_size: int = 20000) -> torch.Tensor:
+    def compute_grid_features(self, sorted_positions: torch.Tensor, rho_p: torch.Tensor, 
+                              grid_shape: tuple, chunk_size: int = 20000) -> torch.Tensor:
         """
         그리드 노드 특징값 계산 (메모리 절약을 위해 Chunk 단위 처리)
         m_c = Σ_{p ∈ N_c} (1/ρ_p) * W(||x_c - x_p||, R)
         
         Args:
-            particle_positions: (N, 3) 파티클 좌표
-            grid_nodes: (G, 3) 그리드 노드 좌표
-            chunk_size: 한 번에 처리할 노드 개수 (기본 10000개)
+            sorted_positions: (N, 3) 정렬된 파티클 좌표
+            rho_p: (N,) 파티클 밀도
+            grid_shape: (Gx, Gy, Gz) 그리드 크기
+            chunk_size: 한 번에 처리할 노드 개수
         
         Returns:
             m_c: (G,) 그리드 특징값
         """
-        # 파티클 밀도 계산
-        rho_p = self.compute_particle_density(particle_positions)
         rho_p = torch.clamp(rho_p, min=1e-6)
         
-        # 1. 3D m_c 그리드 빈 도화지 생성
-        m_c_grid = torch.zeros(grid_shape, device=self.device)
+        # 1. 3D m_c 그리드 빈 도화지 생성 (역전파/가속에 유리한 1D 평탄화 사용)
+        total_cells = grid_shape[0] * grid_shape[1] * grid_shape[2]
+        m_c_flat = torch.zeros(total_cells, device=self.device)
         
         # 2. 커널 반경(R)이 닿는 격자 칸 수 계산 (R = 3*dx 이므로 3칸)
         rad_cells = int(np.ceil(self.R / self.dx)) 
@@ -129,12 +222,12 @@ class FeatureConstruction:
         ox, oy, oz = torch.meshgrid(offsets, offsets, offsets, indexing='ij')
         local_idx = torch.stack([ox, oy, oz], dim=-1).view(-1, 3)  # (343, 3)
         
-        N = particle_positions.shape[0]
+        N = sorted_positions.shape[0]
         
         # 메모리 효율을 위해 파티클도 Chunk 단위로 나누어 스플래팅
         for i in range(0, N, chunk_size):
             end = min(i + chunk_size, N)
-            p_chunk = particle_positions[i:end]
+            p_chunk = sorted_positions[i:end]
             rho_chunk = rho_p[i:end]
             
             # 파티클이 위치한 가장 가까운 '중앙 그리드 인덱스' 역산
@@ -165,17 +258,16 @@ class FeatureConstruction:
             # 유효한 인덱스에만 값을 남기고 밖으로 삐져나간 곳은 0으로 처리
             valid_weights = weighted_kernel[valid_mask]
             
-            # PyTorch put_ 연산을 위해 (x, y, z) 3D 인덱스를 1D 평면 인덱스로 쫙 폅니다.
+            # PyTorch index_put_ 연산을 위해 (x, y, z) 3D 인덱스를 1D 평면 인덱스로 쫙 폅니다.
             flat_indices = (neighbor_idx[..., 0] * grid_shape[1] * grid_shape[2] +
                             neighbor_idx[..., 1] * grid_shape[2] +
                             neighbor_idx[..., 2])
             valid_flat_indices = flat_indices[valid_mask]
             
-            # 🚨 [핵심] 빈 도화지(m_c_grid)에 계산된 특징값들을 한 번에 더해줍니다 (Splatting!)
-            m_c_grid.put_(valid_flat_indices, valid_weights, accumulate=True)
+            # 🚨 [핵심] 빈 도화지에 계산된 특징값들을 한 번에 더해줍니다 (Splatting!)
+            m_c_flat.index_put_((valid_flat_indices,), valid_weights, accumulate=True)
             
-        # 기존 파이프라인(1D 출력)과 호환되도록 평탄화하여 리턴
-        return m_c_grid.view(-1)
+        return m_c_flat
     
     def __call__(self, particle_positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, tuple]:
         """
@@ -191,11 +283,16 @@ class FeatureConstruction:
         """
         particle_positions = particle_positions.float()
         
-        # 그리드 생성 (좌표 구조만 생성)
-        grid_nodes, grid_shape = self.create_grid(particle_positions)
+        # 1. 공간 해싱 및 공간 정렬 (정렬된 데이터로 전체 파이프라인을 관통하여 VRAM/속도 최적화)
+        sorted_positions, sorted_keys = self._spatial_hash_and_sort(particle_positions)
+        start_indices, end_indices = self._build_cell_offsets(sorted_keys)
         
-        # [수정] 그리드 좌표를 넘기지 않고 shape만 넘겨 내부에서 Splatting 처리
-        m_c = self.compute_grid_features(particle_positions, grid_shape)
+        # 2. 밀도 계산
+        rho_p = self.compute_particle_density(sorted_positions, sorted_keys, start_indices, end_indices)
+        
+        # 3. 그리드 생성 및 피처 계산 (Splatting)
+        grid_nodes, grid_shape = self.create_grid()
+        m_c = self.compute_grid_features(sorted_positions, rho_p, grid_shape)
         
         return grid_nodes, m_c, grid_shape
 
