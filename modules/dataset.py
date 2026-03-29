@@ -9,42 +9,33 @@ class SDFDataset(Dataset):
     미리 계산된 SDF 그리드와 m_c 특징 그리드(.npy) 쌍을 불러와 
     8x8x8 슬라이딩 윈도우 패치(Patch) 단위로 분할하여 제공하는 학습 데이터셋.
     """
-    def __init__(self, data_dir="dataset", patch_size=8, in_memory=True):
+    def __init__(self, data_dir="dataset", patch_size=8, in_memory=True, use_narrow_band=True):
         """
         Args:
-            data_dir: .npy 파일들이 저장된 최상단 폴더 (예: 'dataset')
-            patch_size: 입력 특징 패치 크기 (기본값 8, 8x8x8)
-            in_memory: True일 경우 RAM에 전체 그리드를 먼저 불러옴 (학습 속도 대폭 향상) 
+            data_dir: .npy 파일 경로
+            patch_size: 입력 특징 패치 크기
+            in_memory: RAM 캐싱 여부
+            use_narrow_band: True일 경우 논문처럼 표면 근처(Narrow Band) 데이터만 필터링하여 학습
         """
         super().__init__()
         self.patch_size = patch_size
         self.half_size = patch_size // 2
         self.in_memory = in_memory
+        self.use_narrow_band = use_narrow_band  # 🚨 파라미터 저장
         
-        # 데이터 디렉토리 내의 파일 목록 검색 (이전 Phase에서 생성했던 파일 구조에 대응)
-        # 예: sdf_grid_64.npy 형태나, 서브 폴더에 저장된 형태를 찾음
-        # 현 프로젝트 구조상 단일 파일 형태나 여러 파일들이 섞여 있을 수 있으므로 sdf_grid_*, mc_grid_* 로 매치.
         self.sdf_files = sorted(glob.glob(os.path.join(data_dir, "sdf_grid*.npy")))
         self.mc_files = sorted(glob.glob(os.path.join(data_dir, "mc_grid*.npy")))
         
         if len(self.sdf_files) == 0:
-            print(f"⚠️ 경고: '{data_dir}' 경로에서 데이터셋 파일을 찾지 못했습니다. 경로를 확인해주세요.")
-            self.num_shapes = 0
-            self.total_samples = 0
+            print(f"⚠️ 경고: '{data_dir}' 경로에서 데이터셋 파일을 찾지 못했습니다.")
+            self.num_shapes, self.total_samples = 0, 0
             return
-            
-        if len(self.sdf_files) != len(self.mc_files):
-            print(f"⚠️ 경고: SDF 파일 개수({len(self.sdf_files)})와 m_c 파일 개수({len(self.mc_files)})가 다릅니다.")
             
         self.num_shapes = min(len(self.sdf_files), len(self.mc_files))
         
-        # 첫 번째 파일의 형태를 읽어 전체 그리드 해상도 파악
         sample_grid = np.load(self.sdf_files[0])
-        self.grid_shape = sample_grid.shape # 예: (64, 64, 64)
+        self.grid_shape = sample_grid.shape 
         self.num_nodes_per_shape = np.prod(self.grid_shape)
-        
-        # 전체 데이터 개수 = 도형 1개당 발생할 수 있는 sliding window 경우의 수 * 전체 도형 개수
-        self.total_samples = self.num_shapes * self.num_nodes_per_shape
         
         self.sdf_data = []
         self.mc_data = []
@@ -56,6 +47,38 @@ class SDFDataset(Dataset):
                 self.mc_data.append(np.load(self.mc_files[i]))
             print("✅ 캐싱 완료.")
 
+        # 🚨 [추가된 분기 처리] 파라미터에 따라 Narrow Band 필터링을 할지 말지 결정합니다.
+        if self.use_narrow_band:
+            self._apply_narrow_band_filtering()
+        else:
+            self.total_samples = self.num_shapes * self.num_nodes_per_shape
+            print(f"✅ 전체 노드 학습 모드 가동: 총 {self.total_samples}개 샘플")
+
+    def _apply_narrow_band_filtering(self):
+        """[신규 함수] 논문 기반 Narrow Band 필터링을 수행합니다."""
+        self.valid_samples = [] 
+        
+        dx = 1.0 / self.grid_shape[0]
+        narrow_band_threshold = 2.0 * dx  # 논문 기준 [-2dx, 2dx]
+        
+        print(f"🔍 표면 근처(Narrow Band: |SDF| <= {narrow_band_threshold:.4f}) 노드만 필터링 중...")
+        
+        for i in range(self.num_shapes):
+            if self.in_memory:
+                sdf_grid = self.sdf_data[i]
+            else:
+                sdf_grid = np.load(self.sdf_files[i])
+                
+            valid_coords = np.where(np.abs(sdf_grid) <= narrow_band_threshold)
+            
+            for x, y, z in zip(*valid_coords):
+                linear_idx = np.ravel_multi_index((x, y, z), self.grid_shape)
+                self.valid_samples.append((i, linear_idx))
+                
+        self.total_samples = len(self.valid_samples)
+        total_possible_nodes = self.num_shapes * self.num_nodes_per_shape
+        
+        print(f"✅ 필터링 완료: 전체 {total_possible_nodes}개 중 핵심 {self.total_samples}개만 학습합니다! (약 {(self.total_samples/total_possible_nodes)*100:.1f}%)")
     def __len__(self):
         return self.total_samples
 
