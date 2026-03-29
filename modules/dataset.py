@@ -59,19 +59,18 @@ class SDFDataset(Dataset):
     def __len__(self):
         return self.total_samples
 
-    def extract_patch(self, grid, center_3d_idx):
+    def extract_patch(self, grid, center_3d_idx, patch_size):
         """
         3D 그리드에서 (patch_size, patch_size, patch_size) 크기로 패치를 자릅니다.
         가장자리(Boundary)에 위치한 노드일 경우 Zero Padding을 적용합니다.
         """
-        start_idx = [c - self.half_size for c in center_3d_idx]
-        end_idx = [c + self.half_size for c in center_3d_idx]
-        
+        half_size = patch_size // 2
+        start_idx = [c - half_size for c in center_3d_idx]
+        end_idx = [s + patch_size for s in start_idx]
         # 1. 그리드를 벗어나는 '패딩 필요량' 계산
         pad_before = [max(0, -s) for s in start_idx]
         pad_after = [max(0, e - g) for e, g in zip(end_idx, self.grid_shape)]
         
-        # 2. 실제 그리드 내부에서 안전하게 잘라낼 좌표
         grid_start = [max(0, s) for s in start_idx]
         grid_end = [min(g, e) for g, e in zip(self.grid_shape, end_idx)]
         
@@ -93,9 +92,7 @@ class SDFDataset(Dataset):
             mode='constant',
             constant_values=0
         )
-        
-        # 모델 입력 포맷 형태: (Channel=1, Depth, Height, Width)
-        return np.expand_dims(padded_patch, axis=0)
+        return padded_patch
 
     def __getitem__(self, idx):
         # 1. 사용할 도형(쉐입) 인덱스 식별
@@ -115,14 +112,15 @@ class SDFDataset(Dataset):
             sdf_grid = np.load(self.sdf_files[shape_idx])
             mc_grid = np.load(self.mc_files[shape_idx])
             
-        # 4. 특징 특징 패치 잘라내기
-        patch = self.extract_patch(mc_grid, center_3d_idx)
+        # 4. 입력용 m_c 특징 패치 추출 (8x8x8) -> 형태: (1, 8, 8, 8)
+        input_patch = self.extract_patch(mc_grid, center_3d_idx, self.patch_size)
+        input_patch = np.expand_dims(input_patch, axis=0) 
         
-        # 5. 정답 추출
-        sdf_val = sdf_grid[center_3d_idx]
+        # 5. 정답용 SDF 패치 추출 (3x3x3) -> 형태: (27,)
+        target_patch = self.extract_patch(sdf_grid, center_3d_idx, patch_size=3)
+        target_patch_flat = target_patch.flatten() # 1D 배열로 평탄화
         
-        # 텐서 변환 (입력 채널 1, 정답 스칼라 1)
-        return torch.tensor(patch, dtype=torch.float32), torch.tensor([sdf_val], dtype=torch.float32)
+        return torch.tensor(input_patch, dtype=torch.float32), torch.tensor(target_patch_flat, dtype=torch.float32)
 
 
 def create_dataloader(data_dir="dataset", batch_size=32, in_memory=True, num_workers=0, patch_size=8):

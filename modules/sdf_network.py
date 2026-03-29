@@ -12,21 +12,62 @@ import numpy as np
 from typing import Tuple, Optional
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-"""
-3D SDF 재구성 네트워크 모듈
-- Poly6 커널 기반 특징값(m_c) 계산
-- 3D CNN 기반 SDF 예측 모델
-- 전체 파이프라인 통합
-"""
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from typing import Tuple, Optional
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+class PolynomialRegularizedSDFLoss(nn.Module):
+    def __init__(self, lambda_reg=1.0):
+        """
+        논문 Section 3.3에 기반한 SDF 손실 함수
+        Args:
+            lambda_reg: 다항식 정규화 항의 가중치 (논문에서는 1.0 사용)
+        """
+        super().__init__()
+        self.lambda_reg = lambda_reg
+        self.mse_loss = nn.MSELoss()
 
+        # 1. 3x3x3 패치의 로컬 좌표 생성 (x, y, z ∈ {-1, 0, 1})
+        # 논문에서는 중심을 기준으로 -1, 0, 1의 좌표계를 사용합니다.
+        coords = torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float32)
+        x, y, z = torch.meshgrid(coords, coords, coords, indexing='ij')
+        x = x.flatten()
+        y = y.flatten()
+        z = z.flatten()
+
+        # 2. 2차 다항식을 위한 Vandermonde 행렬 A (27 x 10) 생성
+        A = torch.stack([
+            x**2, y**2, z**2,
+            x*y, y*z, x*z,
+            x, y, z,
+            torch.ones_like(x)
+        ], dim=1)
+
+        # 3. 투영 행렬 K = I - A(A^T A)^{-1} A^T 계산
+        # torch.linalg.pinv를 사용하면 (A^T A)^{-1} A^T 계산을 수치적으로 매우 안정하게 수행할 수 있습니다.
+        A_pinv = torch.linalg.pinv(A)
+        I = torch.eye(27)
+        K = I - torch.matmul(A, A_pinv)
+
+        # 4. K 행렬을 buffer로 등록 
+        # (학습되지 않는 상수 텐서로 취급되며, 모델이 GPU로 갈 때 자동으로 같이 이동합니다)
+        self.register_buffer('K', K)
+
+    def forward(self, pred, target):
+        """
+        Args:
+            pred: 모델의 예측값. Shape (Batch, 27)
+            target: 정답 SDF값. Shape (Batch, 27)
+        """
+        # 1. 기본 L2(MSE) 손실
+        loss_data = self.mse_loss(pred, target)
+
+        # 2. 다항식 정규화 손실: L_p = ||K \Phi||_2^2
+        # K는 대칭 행렬이므로 pred @ K 나 K @ pred 모두 동일하게 연산됩니다.
+        K_pred = torch.matmul(pred, self.K) # (Batch, 27) * (27, 27) -> (Batch, 27)
+        
+        # 각 배치마다 27개 원소의 제곱합을 구한 뒤 평균을 냅니다.
+        loss_reg = torch.mean(torch.sum(K_pred ** 2, dim=1))
+
+        # 3. 최종 Loss 반환
+        return loss_data + (self.lambda_reg * loss_reg)
 
 # ===========================
 # 1. 전처리 모듈: Feature Construction
@@ -340,7 +381,7 @@ class SDFNetwork(nn.Module):
         self.fc2 = nn.Linear(256, 128)
         
         # Fully Connected Layer 3 (Output)
-        self.fc3 = nn.Linear(128, 1)
+        self.fc3 = nn.Linear(128, 27)
         
         self.activation = nn.LeakyReLU(0.1)
         self.dropout = nn.Dropout(0.3)
@@ -351,7 +392,7 @@ class SDFNetwork(nn.Module):
             x: (Batch, 1, 8, 8, 8) 특징값 블록
         
         Returns:
-            sdf: (Batch, 1) SDF 값
+            sdf: (Batch, 27) 주변 3x3x3 영역의 SDF 값
         """
         # Conv1 + BN + Activation
         x = self.conv1(x)
@@ -416,7 +457,7 @@ class SDFNetwork(nn.Module):
                 sdf_gt = sdf_gt.to(device)
                 optimizer.zero_grad()
                 output = self.forward(feature_patch)
-                loss = criterion(output.squeeze(-1), sdf_gt)
+                loss = criterion(output, sdf_gt)
                 loss.backward()
                 optimizer.step()
                 running_loss += loss.item() * feature_patch.size(0)
@@ -446,9 +487,9 @@ class SDFReconstruction:
         self.network = SDFNetwork().to(device)
     
     def extract_local_features(self, m_c_grid: torch.Tensor, 
-                              center_idx: int,
-                              grid_shape: tuple,
-                              patch_size: int = 8) -> torch.Tensor:
+                               center_idx: int,
+                               grid_shape: tuple,
+                               patch_size: int = 8) -> torch.Tensor:
         """
         중심 노드 선형 인덱스를 받아서 주변 8×8×8 패치 추출 (패딩 포함)
         """
@@ -509,7 +550,7 @@ class SDFReconstruction:
         return m_c_grid, grid_nodes, grid_shape
     
     def forward(self, particle_positions: torch.Tensor, 
-                batch_size: int = 512) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
+                batch_size: int = 256) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
         """
         [수정됨] 전체 파이프라인: 파티클 -> SDF 값
         """
@@ -543,9 +584,13 @@ class SDFReconstruction:
                 # (Batch, 1, 8, 8, 8) 형태로 결합
                 batch_tensor = torch.cat(batch_patches, dim=0).to(self.device)
                 
-                # 모델 통과
+                # 모델 통과 (🚨 이 부분이 누락되어 추가했습니다)
                 batch_sdf = self.network(batch_tensor)
-                sdf_values[i:batch_end] = batch_sdf.squeeze(-1)
+                
+                # 예측된 27개 값 중 타겟 노드의 정중앙 SDF 값(인덱스 13) 추출
+                center_sdf = batch_sdf[:, 13]
+                
+                sdf_values[i:batch_end] = center_sdf
                 
                 if (i % (batch_size * 10)) == 0:
                     print(f"추론 진행률: {i}/{num_nodes} ({(i/num_nodes)*100:.1f}%)")

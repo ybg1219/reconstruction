@@ -3,7 +3,7 @@ class Config:
     def __init__(self):
         # 1. 공간(도메인) 설정
         self.domain_size = 2.0
-        self.resolution = 64
+        self.resolution = 128
         
         # 2. 파티클 샘플링 설정
         self.num_particles = 40000

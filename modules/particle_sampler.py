@@ -46,11 +46,13 @@ def sample_particles_poisson(sdf_grid, config, target_ppc=3.0):
 
     # 3. SciPy 엔진 초기화 및 BB 내 샘플링
     # 전체 도메인이 아닌 BB 영역만큼의 가로세로비(d=3)를 채웁니다.
-    engine = qmc.PoissonDisk(d=3, radius=unit_radius, hypersphere='volume', ncandidates=30)
+    engine = qmc.PoissonDisk(d=3, radius=unit_radius, hypersphere='volume', ncandidates=10)
+    print(f"   -> BB 비율: {(np.prod(bb_size_world)/domain_size**3)*100:.1f}%")
     
     # 4. 샘플링 (BBox 공간에 대해 꽉 채워서 생성)
     try:
         # BB를 0~1 공간으로 간주하고 샘플 생성
+        print(f"   -> 샘플링 실행")
         sample_points = engine.fill_space()
     except Exception as e:
         print(f"⚠️ 샘플링 실패: {e}")
@@ -58,7 +60,7 @@ def sample_particles_poisson(sdf_grid, config, target_ppc=3.0):
 
     # 5. 좌표 변환 (0~1 -> BBox 월드 좌표계로 변환)
     world_points = bb_min_world + sample_points * max_bb_dim
-    
+
     # BB 외부로 나가는 포인트 필터링 (max_bb_dim 사용 시 발생 가능)
     mask_in_bb = np.all((world_points >= bb_min_world) & (world_points <= bb_max_world), axis=1)
     world_points = world_points[mask_in_bb]
@@ -72,7 +74,6 @@ def sample_particles_poisson(sdf_grid, config, target_ppc=3.0):
     mask_sdf = sdf_values < 0
     valid_particles = world_points[mask_sdf]
     
-    print(f"   -> BB 비율: {(np.prod(bb_size_world)/domain_size**3)*100:.1f}%")
     print(f"   -> 최종 생성된 파티클 수: {len(valid_particles)}개")
     
     return valid_particles
