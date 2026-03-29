@@ -12,16 +12,19 @@ import numpy as np
 from typing import Tuple, Optional
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+from tqdm import tqdm
+
 
 class PolynomialRegularizedSDFLoss(nn.Module):
-    def __init__(self, lambda_reg=1.0):
+    def __init__(self, lambda_reg=1.0, use_poly_loss=True):
         """
-        논문 Section 3.3에 기반한 SDF 손실 함수
         Args:
-            lambda_reg: 다항식 정규화 항의 가중치 (논문에서는 1.0 사용)
+            lambda_reg: 다항식 정규화 가중치 (논문 기준 1.0)
+            use_poly_loss: True면 다항식 정규화 + MSE, False면 순수 MSE만 적용
         """
         super().__init__()
         self.lambda_reg = lambda_reg
+        self.use_poly_loss = use_poly_loss
         self.mse_loss = nn.MSELoss()
 
         # 1. 3x3x3 패치의 로컬 좌표 생성 (x, y, z ∈ {-1, 0, 1})
@@ -58,6 +61,10 @@ class PolynomialRegularizedSDFLoss(nn.Module):
         """
         # 1. 기본 L2(MSE) 손실
         loss_data = self.mse_loss(pred, target)
+
+        # 🚨 스위치가 False면 여기서 순수 MSE만 반환하고 끝냅니다!
+        if not self.use_poly_loss:
+            return loss_data
 
         # 2. 다항식 정규화 손실: L_p = ||K \Phi||_2^2
         # K는 대칭 행렬이므로 pred @ K 나 K @ pred 모두 동일하게 연산됩니다.
@@ -351,7 +358,7 @@ class SDFNetwork(nn.Module):
             kernel_size: Conv3d 커널 크기
             padding: Conv3d 패딩
         """
-        super(SDFNetwork, self).__init__()
+        super().__init__()
         
         # Conv3d Layer 1: (1, 8, 8, 8) -> (32, 8, 8, 8)
         self.conv1 = nn.Conv3d(1, 32, kernel_size=kernel_size, padding=padding)
@@ -435,7 +442,8 @@ class SDFNetwork(nn.Module):
         
         return sdf
 
-    def train_step(self, train_loader, optimizer, criterion, device='cpu', num_epochs=10, verbose=True):
+    def train_step(self, train_loader, optimizer, criterion, device='cuda', num_epochs=5, max_batches_per_epoch=None):
+        
         """
         SDFNetwork 학습 루프 (여러 에폭)
         Args:
@@ -450,21 +458,38 @@ class SDFNetwork(nn.Module):
         """
         self.train()
         epoch_losses = []
+        
         for epoch in range(num_epochs):
             running_loss = 0.0
-            for batch_idx, (feature_patch, sdf_gt) in enumerate(train_loader):
+            progress_bar = tqdm(train_loader, desc=f"Epoch [{epoch+1:02d}/{num_epochs:02d}]")
+            
+            for batch_idx, (feature_patch, sdf_target) in enumerate(progress_bar):
+                # 조기 종료 조건
+                if max_batches_per_epoch and batch_idx >= max_batches_per_epoch:
+                    break
+                    
+                # 군더더기 없이 GPU로 직행
                 feature_patch = feature_patch.to(device)
-                sdf_gt = sdf_gt.to(device)
+                sdf_target = sdf_target.to(device)
+                
                 optimizer.zero_grad()
-                output = self.forward(feature_patch)
-                loss = criterion(output, sdf_gt)
+                pred_sdf = self.forward(feature_patch)
+                loss = criterion(pred_sdf, sdf_target)
                 loss.backward()
                 optimizer.step()
+
                 running_loss += loss.item() * feature_patch.size(0)
-            avg_loss = running_loss / len(train_loader.dataset)
+                
+                if batch_idx % 10 == 0:
+                    progress_bar.set_postfix({'loss': f"{loss.item():.5f}"})
+                    
+            # 정확한 평균 Loss 계산
+            actual_samples_seen = (batch_idx * train_loader.batch_size) if max_batches_per_epoch else len(train_loader.dataset)
+            avg_loss = running_loss / actual_samples_seen
             epoch_losses.append(avg_loss)
-            if verbose:
-                print(f"Epoch [{epoch+1}/{num_epochs}] Loss: {avg_loss:.6f}")
+            
+            print(f"✅ Epoch {epoch+1} 완료! 평균 Loss: {avg_loss:.6f}\n")
+            
         return epoch_losses
 
 
@@ -596,3 +621,46 @@ class SDFReconstruction:
                     print(f"추론 진행률: {i}/{num_nodes} ({(i/num_nodes)*100:.1f}%)")
 
         return grid_nodes, sdf_values, m_c_grid, grid_shape
+    
+    def inference(self, m_c_grid_tensor: torch.Tensor, patch_size: int = 8, batch_size: int = 2048) -> torch.Tensor:
+        """
+        
+        """
+        # 🚨 model 대신 self.network 사용
+        self.network.eval() 
+        
+        grid_shape = m_c_grid_tensor.shape
+        num_nodes = grid_shape[0] * grid_shape[1] * grid_shape[2]
+        
+        # 1. 제로 패딩 부착
+        pad_before = patch_size // 2         # 4
+        pad_after = patch_size - pad_before - 1 # 3
+        
+        padding_tuple = (pad_before, pad_after, pad_before, pad_after, pad_before, pad_after)
+        padded_grid = F.pad(m_c_grid_tensor, padding_tuple, mode='constant', value=0)
+        # 2. PyTorch Unfold로 26만 개 패치 캡처 및 형태 변환
+        patches = padded_grid.unfold(0, patch_size, 1).unfold(1, patch_size, 1).unfold(2, patch_size, 1)
+        all_patches = patches.contiguous().view(-1, 1, patch_size, patch_size, patch_size)
+        
+        # 🚨 device 대신 self.device 사용
+        sdf_values = torch.zeros(num_nodes, device=self.device)
+        patch_batches = torch.split(all_patches, batch_size)
+        
+        # 3. 모델 배치 추론
+        current_idx = 0
+        with torch.no_grad():
+            for batch_tensor in patch_batches:
+                # 🚨 device 대신 self.device 사용
+                batch_tensor = batch_tensor.to(self.device)
+                
+                # 🚨 model 대신 self.network 사용
+                batch_sdf = self.network(batch_tensor)
+                
+                # 27개 중 13번째(중앙) 값만 최종 공간에 대입
+                center_sdf = batch_sdf[:, 13]
+                
+                batch_len = batch_tensor.size(0)
+                sdf_values[current_idx : current_idx + batch_len] = center_sdf
+                current_idx += batch_len
+                
+        return sdf_values.reshape(grid_shape)

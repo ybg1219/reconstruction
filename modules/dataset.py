@@ -116,18 +116,17 @@ class SDFDataset(Dataset):
             constant_values=0
         )
         return padded_patch
-
+    
     def __getitem__(self, idx):
-        # 1. 사용할 도형(쉐입) 인덱스 식별
-        shape_idx = idx // self.num_nodes_per_shape
-        
-        # 2. 해당 도형(NxNxN 그리드) 내부에서의 선형 인덱스(0 ~ N^3 - 1)
-        node_idx = idx % self.num_nodes_per_shape
-        
-        # 선형 인덱스를 3D (X, Y, Z) 좌표계 인덱스로 변환 (Sliding Window 핵심)
+        # Narrow Band 필터링 여부에 따른 인덱스 추출
+        if getattr(self, 'use_narrow_band', True):
+            shape_idx, node_idx = self.valid_samples[idx]
+        else:
+            shape_idx = idx // self.num_nodes_per_shape
+            node_idx = idx % self.num_nodes_per_shape
+            
         center_3d_idx = np.unravel_index(node_idx, self.grid_shape)
         
-        # 3. 데이터 로드
         if self.in_memory:
             sdf_grid = self.sdf_data[shape_idx]
             mc_grid = self.mc_data[shape_idx]
@@ -135,21 +134,33 @@ class SDFDataset(Dataset):
             sdf_grid = np.load(self.sdf_files[shape_idx])
             mc_grid = np.load(self.mc_files[shape_idx])
             
-        # 4. 입력용 m_c 특징 패치 추출 (8x8x8) -> 형태: (1, 8, 8, 8)
+        # 1. 입력 패치 (8x8x8) 추출 및 (1, 8, 8, 8) 채널 차원 보장
         input_patch = self.extract_patch(mc_grid, center_3d_idx, self.patch_size)
-        input_patch = np.expand_dims(input_patch, axis=0) 
+        if input_patch.ndim == 3:
+            input_patch = np.expand_dims(input_patch, axis=0) 
         
-        # 5. 정답용 SDF 패치 추출 (3x3x3) -> 형태: (27,)
+        # 2. 정답 패치 (3x3x3) 추출 및 1차원(27,) 평탄화
         target_patch = self.extract_patch(sdf_grid, center_3d_idx, patch_size=3)
-        target_patch_flat = target_patch.flatten() # 1D 배열로 평탄화
+        target_patch_flat = target_patch.flatten() 
         
-        return torch.tensor(input_patch, dtype=torch.float32), torch.tensor(target_patch_flat, dtype=torch.float32)
+        # 3. float32 텐서로 완벽히 포맷팅하여 반환 (학습 루프 병목 제거!)
+        input_tensor = torch.tensor(input_patch, dtype=torch.float32)
+        target_tensor = torch.tensor(target_patch_flat, dtype=torch.float32)
+        
+        return input_tensor, target_tensor
 
-
-def create_dataloader(data_dir="dataset", batch_size=32, in_memory=True, num_workers=0, patch_size=8):
-    """SDF 네트워크 학습용 데이터로더 생성기"""
-    dataset = SDFDataset(data_dir=data_dir, patch_size=patch_size, in_memory=in_memory)
+def create_dataloader(data_dir="dataset", batch_size=32, in_memory=True, num_workers=0, patch_size=8, use_narrow_band=True):
+    """SDF 네트워크 학습용 데이터로더 생성기 (Narrow Band 지원)"""
+    
+    # 🚨 dataset을 생성할 때 use_narrow_band 파라미터를 넘겨주도록 추가했습니다.
+    dataset = SDFDataset(
+        data_dir=data_dir, 
+        patch_size=patch_size, 
+        in_memory=in_memory,
+        use_narrow_band=use_narrow_band  # <-- 바로 이 부분!
+    )
     
     # 학습 시에는 Sliding Window로 추출된 여러 도형의 노드들이 골고루 섞여야 하므로 shuffle=True 사용
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    
     return dataloader
