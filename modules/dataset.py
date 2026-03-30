@@ -3,25 +3,31 @@ import glob
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-
+import random
 class SDFDataset(Dataset):
     """
     미리 계산된 SDF 그리드와 m_c 특징 그리드(.npy) 쌍을 불러와 
     8x8x8 슬라이딩 윈도우 패치(Patch) 단위로 분할하여 제공하는 학습 데이터셋.
     """
-    def __init__(self, data_dir="dataset", patch_size=8, in_memory=True, use_narrow_band=True):
+    def __init__(self, data_dir="dataset", patch_size=8, in_memory=True, use_narrow_band=True, use_bg_sample=True, bg_sample_ratio=0.05):
         """
         Args:
             data_dir: .npy 파일 경로
             patch_size: 입력 특징 패치 크기
             in_memory: RAM 캐싱 여부
             use_narrow_band: True일 경우 논문처럼 표면 근처(Narrow Band) 데이터만 필터링하여 학습
+            use_bg_sample: True일 경우 표면 이외의 배경(허공/내부) 노드를 일부 섞어서 학습 (공간감 학습용)
+            bg_sample_ratio: 배경 데이터를 추출할 비율 (기본값 0.05 = 5%)
         """
         super().__init__()
         self.patch_size = patch_size
         self.half_size = patch_size // 2
         self.in_memory = in_memory
-        self.use_narrow_band = use_narrow_band  # 🚨 파라미터 저장
+        
+        # 🚨 옵션 파라미터 저장
+        self.use_narrow_band = use_narrow_band  
+        self.use_bg_sample = use_bg_sample
+        self.bg_sample_ratio = bg_sample_ratio
         
         self.sdf_files = sorted(glob.glob(os.path.join(data_dir, "sdf_grid*.npy")))
         self.mc_files = sorted(glob.glob(os.path.join(data_dir, "mc_grid*.npy")))
@@ -40,6 +46,7 @@ class SDFDataset(Dataset):
         self.sdf_data = []
         self.mc_data = []
         
+        # 1. 데이터 캐싱
         if self.in_memory:
             print("💾 데이터를 메모리에 캐싱 중입니다...")
             for i in range(self.num_shapes):
@@ -47,21 +54,29 @@ class SDFDataset(Dataset):
                 self.mc_data.append(np.load(self.mc_files[i]))
             print("✅ 캐싱 완료.")
 
-        # 🚨 [추가된 분기 처리] 파라미터에 따라 Narrow Band 필터링을 할지 말지 결정합니다.
+        # 2. 파라미터에 따라 Narrow Band 필터링 분기 처리
         if self.use_narrow_band:
             self._apply_narrow_band_filtering()
         else:
             self.total_samples = self.num_shapes * self.num_nodes_per_shape
-            print(f"✅ 전체 노드 학습 모드 가동: 총 {self.total_samples}개 샘플")
+            print(f"✅ 전체 노드 학습 모드 가동: 총 {self.total_samples}개 샘플 (필터링 안 함)")
 
     def _apply_narrow_band_filtering(self):
-        """[신규 함수] 논문 기반 Narrow Band 필터링을 수행합니다."""
+        """
+        표면 근처 노드를 필터링하고, 옵션에 따라 배경 노드를 섞어주는 초고속 함수 (NumPy 벡터 연산 사용)
+        """
         self.valid_samples = [] 
-        
         dx = 1.0 / self.grid_shape[0]
-        narrow_band_threshold = 2.0 * dx  # 논문 기준 [-2dx, 2dx]
+        narrow_band_threshold = 4.0 * dx  
         
-        print(f"🔍 표면 근처(Narrow Band: |SDF| <= {narrow_band_threshold:.4f}) 노드만 필터링 중...")
+        mode_str = f"표면(|SDF| <= {narrow_band_threshold:.4f})"
+        if self.use_bg_sample:
+            mode_str += f" + 배경({self.bg_sample_ratio*100}%) 혼합"
+        
+        print(f"🔍 [초고속 필터링] {mode_str} 샘플링 중...")
+        
+        total_surface = 0
+        total_bg = 0
         
         for i in range(self.num_shapes):
             if self.in_memory:
@@ -69,16 +84,42 @@ class SDFDataset(Dataset):
             else:
                 sdf_grid = np.load(self.sdf_files[i])
                 
-            valid_coords = np.where(np.abs(sdf_grid) <= narrow_band_threshold)
+            # NumPy 벡터 연산을 위해 그리드를 1차원으로 펼침 (속도 향상의 핵심!)
+            sdf_flat = sdf_grid.flatten()
             
-            for x, y, z in zip(*valid_coords):
-                linear_idx = np.ravel_multi_index((x, y, z), self.grid_shape)
-                self.valid_samples.append((i, linear_idx))
+            # 1. Narrow Band (표면) 마스크 및 인덱스 추출
+            surface_mask = np.abs(sdf_flat) <= narrow_band_threshold
+            surface_indices = np.where(surface_mask)[0] 
+            
+            for idx in surface_indices:
+                self.valid_samples.append((i, idx))
+            total_surface += len(surface_indices)
+            
+            # 2. 배경(Background) 샘플링 로직 (파라미터가 True일 때만 실행)
+            if self.use_bg_sample:
+                bg_mask = ~surface_mask # 표면이 아닌 모든 곳
+                bg_indices = np.where(bg_mask)[0]
                 
+                # 지정된 비율만큼 랜덤 추출 (replace=False: 중복 방지)
+                num_bg_to_sample = int(len(bg_indices) * self.bg_sample_ratio)
+                if num_bg_to_sample > 0:
+                    sampled_bg_indices = np.random.choice(bg_indices, size=num_bg_to_sample, replace=False)
+                    for idx in sampled_bg_indices:
+                        self.valid_samples.append((i, idx))
+                    total_bg += num_bg_to_sample
+                
+        # 3. 모델이 편식하지 않도록(표면만 학습하다 배경만 학습하는 현상 방지) 최종 데이터 섞기
+        random.shuffle(self.valid_samples)
+        
         self.total_samples = len(self.valid_samples)
         total_possible_nodes = self.num_shapes * self.num_nodes_per_shape
         
-        print(f"✅ 필터링 완료: 전체 {total_possible_nodes}개 중 핵심 {self.total_samples}개만 학습합니다! (약 {(self.total_samples/total_possible_nodes)*100:.1f}%)")
+        # 4. 결과 출력
+        print(f"✅ 샘플링 완료!")
+        print(f"   - 표면(Narrow Band) 데이터: {total_surface}개 (100% 사용)")
+        if self.use_bg_sample:
+            print(f"   - 배경(Background) 데이터: {total_bg}개 ({self.bg_sample_ratio*100}% 랜덤 추출)")
+        print(f"   - 최종 학습 데이터: {self.total_samples}개 (전체 중 {(self.total_samples/total_possible_nodes)*100:.1f}%)")
     def __len__(self):
         return self.total_samples
 
@@ -148,19 +189,3 @@ class SDFDataset(Dataset):
         target_tensor = torch.tensor(target_patch_flat, dtype=torch.float32)
         
         return input_tensor, target_tensor
-
-def create_dataloader(data_dir="dataset", batch_size=32, in_memory=True, num_workers=0, patch_size=8, use_narrow_band=True):
-    """SDF 네트워크 학습용 데이터로더 생성기 (Narrow Band 지원)"""
-    
-    # 🚨 dataset을 생성할 때 use_narrow_band 파라미터를 넘겨주도록 추가했습니다.
-    dataset = SDFDataset(
-        data_dir=data_dir, 
-        patch_size=patch_size, 
-        in_memory=in_memory,
-        use_narrow_band=use_narrow_band  # <-- 바로 이 부분!
-    )
-    
-    # 학습 시에는 Sliding Window로 추출된 여러 도형의 노드들이 골고루 섞여야 하므로 shuffle=True 사용
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    
-    return dataloader
