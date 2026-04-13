@@ -4,39 +4,62 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 import random
+
 class SDFDataset(Dataset):
     """
     미리 계산된 SDF 그리드와 m_c 특징 그리드(.npy) 쌍을 불러와 
     8x8x8 슬라이딩 윈도우 패치(Patch) 단위로 분할하여 제공하는 학습 데이터셋.
     """
-    def __init__(self, data_dir="dataset", patch_size=8, in_memory=True, use_narrow_band=True, use_bg_sample=True, bg_sample_ratio=0.05):
-        """
-        Args:
-            data_dir: .npy 파일 경로
-            patch_size: 입력 특징 패치 크기
-            in_memory: RAM 캐싱 여부
-            use_narrow_band: True일 경우 논문처럼 표면 근처(Narrow Band) 데이터만 필터링하여 학습
-            use_bg_sample: True일 경우 표면 이외의 배경(허공/내부) 노드를 일부 섞어서 학습 (공간감 학습용)
-            bg_sample_ratio: 배경 데이터를 추출할 비율 (기본값 0.05 = 5%)
-        """
+    # 🚨 [수정됨] feature_constructor 파라미터 추가
+    def __init__(self, data_dir="dataset", patch_size=8, in_memory=True, 
+                 use_narrow_band=True, use_bg_sample=True, bg_sample_ratio=0.05,
+                 feature_constructor=None):
         super().__init__()
         self.patch_size = patch_size
         self.half_size = patch_size // 2
         self.in_memory = in_memory
         
-        # 🚨 옵션 파라미터 저장
         self.use_narrow_band = use_narrow_band  
         self.use_bg_sample = use_bg_sample
         self.bg_sample_ratio = bg_sample_ratio
         
         self.sdf_files = sorted(glob.glob(os.path.join(data_dir, "sdf_grid*.npy")))
         self.mc_files = sorted(glob.glob(os.path.join(data_dir, "mc_grid*.npy")))
+        # 🚨 [추가됨] 파티클 파일도 검색합니다.
+        self.particle_files = sorted(glob.glob(os.path.join(data_dir, "particles*.npy")))
         
         if len(self.sdf_files) == 0:
             print(f"⚠️ 경고: '{data_dir}' 경로에서 데이터셋 파일을 찾지 못했습니다.")
             self.num_shapes, self.total_samples = 0, 0
             return
             
+        # =========================================================
+        # 🚨 유연성 확보: mc_grid가 없고 particles만 있을 경우 자동 변환 및 저장
+        # =========================================================
+        if len(self.mc_files) == 0 and len(self.particle_files) > 0:
+            if feature_constructor is None:
+                raise ValueError("❌ mc_grid 파일이 없습니다. particles에서 자동 생성하려면 feature_constructor를 전달해주세요.")
+            
+            print(f"🔄 mc_grid 파일이 없어 particles 데이터로부터 자동 생성을 시작합니다...")
+            for p_file in self.particle_files:
+                particles_np = np.load(p_file)
+                particles_tensor = torch.tensor(particles_np, dtype=torch.float32, device=feature_constructor.device)
+                
+                # 특징맵 계산
+                with torch.no_grad():
+                    _, m_c, grid_shape = feature_constructor(particles_tensor)
+                mc_grid = m_c.reshape(grid_shape).cpu().numpy()
+                
+                # 다음 번 로드를 위해 파일로 저장 (particles_000.npy -> mc_grid_000.npy)
+                base_name = os.path.basename(p_file).replace("particles_", "mc_grid_")
+                mc_filename = os.path.join(data_dir, base_name)
+                
+                np.save(mc_filename, mc_grid)
+                self.mc_files.append(mc_filename)
+                print(f"  -> 변환 및 저장 완료: {mc_filename}")
+            print("✅ mc_grid 자동 생성 완료!\n")
+        # =========================================================
+
         self.num_shapes = min(len(self.sdf_files), len(self.mc_files))
         
         sample_grid = np.load(self.sdf_files[0])
