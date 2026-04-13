@@ -220,7 +220,7 @@ class FeatureConstruction:
             return torch.zeros(0, device=self.device)
         return self._compute_density_hashed(sorted_positions, sorted_keys, start_indices, end_indices)
     
-    def create_grid(self) -> Tuple[torch.Tensor, tuple]:
+    def create_grid(self, offset: tuple = (0.0, 0.0, 0.0)) -> Tuple[torch.Tensor, tuple]:
         """
         파티클 위치 기반 그리드 생성
         
@@ -228,21 +228,22 @@ class FeatureConstruction:
             grid_nodes: (G, 3) 그리드 노드 좌표
             grid_shape: (Gx, Gy, Gz) 그리드 크기
         """
-        # 부동소수점 오차 방지를 위해 linspace 사용
         steps = int(np.round((self.max_bound - self.min_bound) / self.dx)) + 1
         
-        x = torch.linspace(self.min_bound, self.max_bound, steps, device=self.device)
-        y = torch.linspace(self.min_bound, self.max_bound, steps, device=self.device)
-        z = torch.linspace(self.min_bound, self.max_bound, steps, device=self.device)
+        # offset을 더하여 그리드 전체 좌표를 이동시킵니다.
+        x = torch.linspace(self.min_bound, self.max_bound, steps, device=self.device) + offset[0]
+        y = torch.linspace(self.min_bound, self.max_bound, steps, device=self.device) + offset[1]
+        z = torch.linspace(self.min_bound, self.max_bound, steps, device=self.device) + offset[2]
 
         grid_nodes = torch.stack(torch.meshgrid(x, y, z, indexing='ij'), dim=-1)
         grid_shape = (steps, steps, steps)
         grid_nodes = grid_nodes.reshape(-1, 3)
-        
+
         return grid_nodes, grid_shape
     
     def compute_grid_features(self, sorted_positions: torch.Tensor, rho_p: torch.Tensor, 
-                              grid_shape: tuple, chunk_size: int = 20000) -> torch.Tensor:
+                              grid_shape: tuple, chunk_size: int = 20000, 
+                              offset: tuple = (0.0, 0.0, 0.0)) -> torch.Tensor:
         """
         그리드 노드 특징값 계산 (메모리 절약을 위해 Chunk 단위 처리)
         m_c = Σ_{p ∈ N_c} (1/ρ_p) * W(||x_c - x_p||, R)
@@ -252,6 +253,7 @@ class FeatureConstruction:
             rho_p: (N,) 파티클 밀도
             grid_shape: (Gx, Gy, Gz) 그리드 크기
             chunk_size: 한 번에 처리할 노드 개수
+            offset: (추가) 엇갈린 그리드 생성을 위한 오프셋
         
         Returns:
             m_c: (G,) 그리드 특징값
@@ -271,6 +273,10 @@ class FeatureConstruction:
         local_idx = torch.stack([ox, oy, oz], dim=-1).view(-1, 3)  # (343, 3)
         
         N = sorted_positions.shape[0]
+
+        # 🚨 [수정됨] 기본 경계에 오프셋을 더해 기준점을 이동시킵니다.
+        offset_tensor = torch.tensor(offset, device=self.device)
+        base_bound = self.min_bound + offset_tensor
         
         # 메모리 효율을 위해 파티클도 Chunk 단위로 나누어 스플래팅
         for i in range(0, N, chunk_size):
@@ -279,7 +285,8 @@ class FeatureConstruction:
             rho_chunk = rho_p[i:end]
             
             # 파티클이 위치한 가장 가까운 '중앙 그리드 인덱스' 역산
-            idx_float = (p_chunk - self.min_bound) / self.dx
+            # 🚨 [수정됨] self.min_bound 대신 base_bound(이동된 경계) 사용
+            idx_float = (p_chunk - base_bound) / self.dx
             idx_base = torch.round(idx_float).long()  # (Chunk, 3)
             
             # 중앙 인덱스에 343개의 템플릿 오프셋을 더해 '주변 이웃 인덱스들' 계산
@@ -293,7 +300,8 @@ class FeatureConstruction:
             valid_mask = valid_x & valid_y & valid_z  # (Chunk, 343)
             
             # 실제 그리드 노드의 월드 좌표(x, y, z) 계산
-            neighbor_pos = self.min_bound + neighbor_idx.float() * self.dx
+            # 🚨 [수정됨] self.min_bound 대신 base_bound(이동된 경계) 사용
+            neighbor_pos = base_bound + neighbor_idx.float() * self.dx
             
             # 파티클과 주변 343개 이웃 간의 정확한 유클리디안 거리 계산
             diff = neighbor_pos - p_chunk.unsqueeze(1)
@@ -317,12 +325,13 @@ class FeatureConstruction:
             
         return m_c_flat
     
-    def __call__(self, particle_positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, tuple]:
+    def __call__(self, particle_positions: torch.Tensor, offset: tuple = (0.0, 0.0, 0.0)) -> Tuple[torch.Tensor, torch.Tensor, tuple]:
         """
         전체 전처리 파이프라인
         
         Args:
             particle_positions: (N, 3) 파티클 좌표
+            offset: 엇갈린 그리드 생성을 위한 오프셋
         
         Returns:
             grid_nodes: (G, 3) 그리드 노드 좌표
@@ -339,8 +348,8 @@ class FeatureConstruction:
         rho_p = self.compute_particle_density(sorted_positions, sorted_keys, start_indices, end_indices)
         
         # 3. 그리드 생성 및 피처 계산 (Splatting)
-        grid_nodes, grid_shape = self.create_grid()
-        m_c = self.compute_grid_features(sorted_positions, rho_p, grid_shape)
+        grid_nodes, grid_shape = self.create_grid(offset=offset)
+        m_c = self.compute_grid_features(sorted_positions, rho_p, grid_shape, offset=offset)
         
         return grid_nodes, m_c, grid_shape
 
@@ -622,45 +631,114 @@ class SDFReconstruction:
 
         return grid_nodes, sdf_values, m_c_grid, grid_shape
     
-    def inference(self, m_c_grid_tensor: torch.Tensor, patch_size: int = 8, batch_size: int = 2048) -> torch.Tensor:
+    def inference(self, m_c_grid_tensor: torch.Tensor, patch_size: int = 8, 
+                  batch_size: int = 2048, use_pruning: bool = True) -> torch.Tensor:
         """
+        단일 그리드 SDF 추론 함수. 
+        매개변수 use_pruning을 통해 파티클이 없는 영역의 계산 생략 여부를 결정합니다.
         
+        Args:
+            m_c_grid_tensor: 입력 특징 그리드 (HxWxD)
+            patch_size: 입력 패치 크기 (기본 8)
+            batch_size: 한 번에 모델에 넣을 패치 개수
+            use_pruning: True일 경우 파티클이 없는 영역의 CNN 연산을 건너뜁니다.
         """
-        # 🚨 model 대신 self.network 사용
         self.network.eval() 
         
         grid_shape = m_c_grid_tensor.shape
         num_nodes = grid_shape[0] * grid_shape[1] * grid_shape[2]
         
-        # 1. 제로 패딩 부착
-        pad_before = patch_size // 2         # 4
-        pad_after = patch_size - pad_before - 1 # 3
-        
+        # 1. 패치 추출을 위한 제로 패딩 (8x8x8 패치가 경계에서도 중앙 노드를 포함하도록 함)
+        pad_before = patch_size // 2         
+        pad_after = patch_size - pad_before - 1 
         padding_tuple = (pad_before, pad_after, pad_before, pad_after, pad_before, pad_after)
         padded_grid = F.pad(m_c_grid_tensor, padding_tuple, mode='constant', value=0)
-        # 2. PyTorch Unfold로 26만 개 패치 캡처 및 형태 변환
+        
+        # 2. Sliding Window (Unfold)를 이용해 모든 노드에 대한 패치 일괄 생성
+        # (N, 1, 8, 8, 8) 형태의 텐서로 변환
         patches = padded_grid.unfold(0, patch_size, 1).unfold(1, patch_size, 1).unfold(2, patch_size, 1)
-        all_patches = patches.contiguous().view(-1, 1, patch_size, patch_size, patch_size)
+        all_patches = patches.contiguous().view(num_nodes, 1, patch_size, patch_size, patch_size)
         
-        # 🚨 device 대신 self.device 사용
-        sdf_values = torch.zeros(num_nodes, device=self.device)
-        patch_batches = torch.split(all_patches, batch_size)
-        
-        # 3. 모델 배치 추론
-        current_idx = 0
-        with torch.no_grad():
-            for batch_tensor in patch_batches:
-                # 🚨 device 대신 self.device 사용
-                batch_tensor = batch_tensor.to(self.device)
-                
-                # 🚨 model 대신 self.network 사용
-                batch_sdf = self.network(batch_tensor)
-                
-                # 27개 중 13번째(중앙) 값만 최종 공간에 대입
-                center_sdf = batch_sdf[:, 13]
-                
-                batch_len = batch_tensor.size(0)
-                sdf_values[current_idx : current_idx + batch_len] = center_sdf
-                current_idx += batch_len
+        # 3. [가지치기 로직] 연산 대상 선별
+        if use_pruning:
+            # 패치 내부의 m_c 합이 0에 가까우면 파티클이 없는 '허공'으로 판단
+            patch_sums = all_patches.view(num_nodes, -1).abs().sum(dim=1)
+            active_mask = patch_sums > 1e-6  
+            
+            # 결과 텐서를 1.0(허공)으로 초기화 (계산 생략 구역은 자동으로 허공 처리)
+            sdf_values = torch.ones(num_nodes, device=self.device)
+            active_patches = all_patches[active_mask]
+            
+            num_active = active_patches.size(0)
+            print(f"   ✂️ [Pruning ON] {num_nodes}개 중 {num_active}개 노드 연산 ({(num_active/num_nodes)*100:.1f}%)")
+        else:
+            # 가지치기를 쓰지 않을 경우 모든 노드를 연산 대상으로 설정
+            active_mask = torch.ones(num_nodes, dtype=torch.bool, device=self.device)
+            sdf_values = torch.zeros(num_nodes, device=self.device)
+            active_patches = all_patches
+            print(f"   🚫 [Pruning OFF] 전체 {num_nodes}개 노드 모두 연산 중...")
+
+        # 4. 선별된 패치들에 대해 배치 단위 추론 수행
+        if active_patches.size(0) > 0:
+            patch_batches = torch.split(active_patches, batch_size)
+            results_list = []
+            
+            with torch.no_grad():
+                for batch_tensor in patch_batches:
+                    batch_tensor = batch_tensor.to(self.device)
+                    batch_sdf = self.network(batch_tensor)
+                    
+                    # 예측된 27개 값 중 타겟 노드(중앙)인 13번째 인덱스만 추출
+                    results_list.append(batch_sdf[:, 13])
+            
+            # 계산된 결과를 원래 위치(Mask)에 맞게 삽입
+            sdf_values[active_mask] = torch.cat(results_list)
                 
         return sdf_values.reshape(grid_shape)
+    
+    def staggered_inference(self, particle_positions: torch.Tensor, patch_size: int = 8, batch_size: int = 2048) -> torch.Tensor:
+        """
+        논문 3.5절: Multiple, staggered reconstructions
+        8개의 엇갈린 그리드를 생성하고 추론하여 기존 해상도의 2배(2N x 2N x 2N) SDF를 생성합니다.
+        """
+        particle_positions = particle_positions.to(self.device).float()
+        
+        print("🚀 [Staggered Reconstruction] 고해상도(2배) 레벨셋 복원을 시작합니다...")
+        
+        # 1. 속도 최적화: 파티클 간의 밀도(rho_p)는 오프셋과 무관하므로 한 번만 미리 계산합니다.
+        sorted_pos, sorted_keys = self.feature_construction._spatial_hash_and_sort(particle_positions)
+        start_idx, end_idx = self.feature_construction._build_cell_offsets(sorted_keys)
+        rho_p = self.feature_construction.compute_particle_density(sorted_pos, sorted_keys, start_idx, end_idx)
+        
+        # 기본 그리드 크기(N x N x N) 파악을 위해 더미 호출
+        _, base_shape = self.feature_construction.create_grid(offset=(0.0, 0.0, 0.0))
+        
+        # 결과물을 담을 2배 해상도(2N x 2N x 2N) 텐서 준비
+        high_res_shape = (base_shape[0] * 2, base_shape[1] * 2, base_shape[2] * 2)
+        high_res_sdf = torch.zeros(high_res_shape, device=self.device)
+        
+        half_dx = self.dx / 2.0
+        
+        # 2. 8가지 조합(a, b, c)에 대해 오프셋 생성 및 추론 루프
+        for a in [0, 1]:
+            for b in [0, 1]:
+                for c in [0, 1]:
+                    offset = (a * half_dx, b * half_dx, c * half_dx)
+                    print(f" ⏳ 엇갈린 그리드 추론 중... 조합: a={a}, b={b}, c={c} (Offset: {offset})")
+                    
+                    # 오프셋이 적용된 피처맵(m_c) 계산
+                    m_c_flat = self.feature_construction.compute_grid_features(
+                        sorted_pos, rho_p, base_shape, offset=offset
+                    )
+                    m_c_grid_tensor = m_c_flat.reshape(base_shape)
+                    
+                    # 단일 모델 초고속 추론 (N x N x N 결과 획득)
+                    pred_sdf = self.inference(m_c_grid_tensor, patch_size=patch_size, batch_size=batch_size)
+                    
+                    # 3. 🚨 [요구사항 3] 슬라이싱을 이용한 지그재그 병합 (Interweaving)
+                    # 원본 논문의 수식 (2i+a, 2j+b, 2k+c)를 파이썬 텐서 슬라이싱 구문으로 완벽히 치환
+                    high_res_sdf[a::2, b::2, c::2] = pred_sdf
+                    
+        print(f"✅ 해상도 2배 뻥튀기 완료! 최종 형태: {high_res_sdf.shape}")
+        
+        return high_res_sdf
