@@ -62,12 +62,11 @@ class PolynomialRegularizedSDFLoss(nn.Module):
         # 1. 기본 L2(MSE) 손실
         loss_data = self.mse_loss(pred, target)
 
-        # 🚨 스위치가 False면 여기서 순수 MSE만 반환하고 끝냅니다!
+        # False면 여기서 MSE만 반환하고 끝
         if not self.use_poly_loss:
             return loss_data
 
         # 2. 다항식 정규화 손실: L_p = ||K \Phi||_2^2
-        # K는 대칭 행렬이므로 pred @ K 나 K @ pred 모두 동일하게 연산됩니다.
         K_pred = torch.matmul(pred, self.K) # (Batch, 27) * (27, 27) -> (Batch, 27)
         
         # 각 배치마다 27개 원소의 제곱합을 구한 뒤 평균을 냅니다.
@@ -698,12 +697,12 @@ class SDFReconstruction:
     
     def staggered_inference(self, particle_positions: torch.Tensor, patch_size: int = 8, batch_size: int = 2048) -> torch.Tensor:
         """
-        논문 3.5절: Multiple, staggered reconstructions
-        8개의 엇갈린 그리드를 생성하고 추론하여 기존 해상도의 2배(2N x 2N x 2N) SDF를 생성합니다.
+        Multiple, staggered reconstructions
+        8개의 엇갈린 그리드를 생성하고 추론하여 기존 해상도의 2배(2N x 2N x 2N) SDF cnfhs.
         """
         particle_positions = particle_positions.to(self.device).float()
         
-        print("🚀 [Staggered Reconstruction] 고해상도(2배) 레벨셋 복원을 시작합니다...")
+        print("🚀 [Staggered Reconstruction] 해상도(2배) 레벨셋 복원")
         
         # 1. 속도 최적화: 파티클 간의 밀도(rho_p)는 오프셋과 무관하므로 한 번만 미리 계산합니다.
         sorted_pos, sorted_keys = self.feature_construction._spatial_hash_and_sort(particle_positions)

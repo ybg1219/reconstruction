@@ -28,48 +28,47 @@ class SDFGenerator:
         if seed is not None:
             np.random.seed(seed)
             
-        # 메인 도형의 크기가 작아졌으므로 개수를 살짝 늘려 풍성하게 만듭니다
-        num_shapes = np.random.randint(4, 9) 
+        num_shapes = np.random.randint(4, 8) 
         final_sdf = None
         
-        # 🚨 [수정 1] 도메인 경계 설정
-        safe_bound = (self.domain_size / 2.0) - 0.05
+        # 🚨 [해결책 1] 공간 분리: 도메인 절반 크기를 구하고, 도형이 벽에 닿지 않는 최대 스폰 구역을 엄격히 계산합니다.
+        half_domain = self.domain_size / 2.0
+        max_shape_size = 0.7  # (기존 0.35 -> 0.55) 도형 하나가 가질 수 있는 최대 뻗음 거리
+        spawn_bound = half_domain - max_shape_size - 0.05 # 벽에 닿지 않는 중심점 스폰 구역
         
-        # 🚨 [해결책 1] 뭉침 방지: 메인 도형들이 도메인 전역에서 흩어져 스폰되도록 범위를 넓힙니다.
-        spawn_bound = safe_bound * 0.8 
+        # (만약 도메인 크기가 2.0이라면, 중심은 -0.4~0.4 사이에서 생기고 
+        # 최대 0.55만큼 뻗어나가므로 0.95에서 딱 멈춰서 절대 벽에 닿지 않습니다!)
         
-        # 🚨 [추가 1] 'thin_plate' (얇은 판) 옵션 추가
         shape_choices = ['sphere', 'box', 'thin_plate', 'rounded_box', 'capped_cylinder', 'capsule', 'torus', 'capped_cone']
         
         for i in range(num_shapes):
             shape_type = np.random.choice(shape_choices)
             obj = None
             
-            # 뼈대 위치도 넓은 구역(spawn_bound) 안에서 자유롭게 생성
             p_start = np.random.uniform(-spawn_bound, spawn_bound, 3)
             p_end = np.random.uniform(-spawn_bound, spawn_bound, 3)
             
-            # 🚨 [해결책 2] 뭉침 방지: 박스처럼 꽉 차지 않도록 각 도형의 기본 사이즈를 대폭 줄입니다.
+            # 🚨 [수정 2] 개별 도형들의 스펙(반지름, 가로세로 등)을 1.5배 이상 큼직하게 조정
             if shape_type == 'sphere':
-                obj = sphere(np.random.uniform(0.3, 0.5))
+                obj = sphere(np.random.uniform(0.3, max_shape_size))
             elif shape_type == 'box':
-                obj = box(np.random.uniform(0.3, 0.5, 3))
+                obj = box(np.random.uniform(0.3, max_shape_size, 3))
             elif shape_type == 'thin_plate':
-                # 얇은 판 (가로/세로는 넓게, 두께는 매우 얇게 설정)
-                obj = box([np.random.uniform(0.2, 0.5), np.random.uniform(0.2, 0.5), np.random.uniform(0.01, 0.04)])
+                # 판도 훨씬 넓적하게 만듭니다.
+                obj = box([np.random.uniform(0.35, max_shape_size), np.random.uniform(0.35, max_shape_size), np.random.uniform(0.02, 0.05)])
             elif shape_type == 'rounded_box':
-                obj = rounded_box(np.random.uniform(0.3, 0.5, 3), np.random.uniform(0.05, 0.15))
+                obj = rounded_box(np.random.uniform(0.25, max_shape_size, 3), np.random.uniform(0.05, 0.15))
             elif shape_type == 'capped_cylinder':
-                obj = capped_cylinder(p_start, p_end, np.random.uniform(0.15, 0.4))
+                obj = capped_cylinder(p_start, p_end, np.random.uniform(0.2, max_shape_size))
             elif shape_type == 'capsule':
-                obj = capsule(p_start, p_end, np.random.uniform(0.15, 0.4))
+                obj = capsule(p_start, p_end, np.random.uniform(0.2, 0.45))
             elif shape_type == 'torus':
-                r_major = np.random.uniform(0.4, 0.8)
-                r_minor = np.random.uniform(0.1, 0.25)
-                if r_minor >= r_major: r_minor = r_major * 0.5
+                # 튜브도 큼직하고 굵게
+                r_major = np.random.uniform(0.3, 0.45)
+                r_minor = np.random.uniform(0.05, 0.12)
                 obj = torus(r_major, r_minor)
             elif shape_type == 'capped_cone':
-                obj = capped_cone(p_start, p_end, np.random.uniform(0.3, 0.6), np.random.uniform(0.0, 0.4))
+                obj = capped_cone(p_start, p_end, np.random.uniform(0.2, 0.4), np.random.uniform(0.05, 0.15))
     
             if shape_type in ['sphere', 'box', 'thin_plate', 'rounded_box', 'torus']:
                 angle = np.random.uniform(0, 360)
@@ -77,47 +76,41 @@ class SDFGenerator:
                 if np.linalg.norm(axis) > 0:
                     axis = axis / np.linalg.norm(axis)
                     obj = obj.rotate(angle, axis)
-    
-            # 🚨 [해결책 3] 뭉침 방지: 중심 위치(Translation)를 좁은 곳이 아닌 전체(spawn_bound)로 확산시킵니다.
-            pos = np.random.uniform(-spawn_bound, spawn_bound, 3)
-            obj = obj.translate(pos)
+                
+                pos = np.random.uniform(-spawn_bound, spawn_bound, 3)
+                obj = obj.translate(pos)
             
             if final_sdf is None:
                 final_sdf = obj
             else:
-                op = np.random.choice(['union', 'diff', 'smooth'], p=[0.6, 0.2, 0.2])
+                op = np.random.choice(['union', 'diff', 'smooth'], p=[0.7, 0.1, 0.2])
                 if op == 'union':
                     final_sdf = final_sdf | obj
                 elif op == 'diff':
                     final_sdf = final_sdf - obj
                 elif op == 'smooth':
                     try:
-                        final_sdf = final_sdf.smooth_union(obj, k=0.1)
+                        final_sdf = final_sdf.smooth_union(obj, k=0.15) # 스무딩(융합) 범위도 살짝 넓혔습니다
                     except:
                         final_sdf = final_sdf | obj
 
-        # 얇은 선(Thin lines) 추가
-        num_lines = np.random.randint(1, 4)
+        # 얇은 선(Thin lines) (전체 스케일에 맞춰 선도 살짝 굵게 조절)
+        num_lines = np.random.randint(1, 3)
         for _ in range(num_lines):
             p1 = np.random.uniform(-spawn_bound, spawn_bound, 3)
             p2 = np.random.uniform(-spawn_bound, spawn_bound, 3)
-            r = np.random.uniform(0.01, 0.03)  
+            r = np.random.uniform(0.02, 0.05)  
             line = capsule(p1, p2, r)
             final_sdf = final_sdf | line  
             
-        # 🚨 [추가 2] 물방울 흩뿌리기: 크기는 대폭 줄이고(0.005~0.02), 숫자는 늘립니다(20~50개)
-        num_spheres = np.random.randint(20, 50)
-        for _ in range(num_spheres):
-            p = np.random.uniform(-safe_bound, safe_bound, 3)
-            r = np.random.uniform(0.005, 0.02)  # 진짜 물방울 사이즈
-            s = sphere(r).translate(p)
-            final_sdf = final_sdf | s  
-
-        # 🚨 [해결책 4] 이탈 방지 쐐기 크기 수정: 
-        # 도메인의 95% 크기 수준으로 넉넉하게 자르는 상자를 만들어, 어색한 깍두기 절단을 방지합니다.
-        clip_size = self.domain_size * 0.95
-        bounding_box = box([clip_size, clip_size, clip_size])
-        final_sdf = final_sdf & bounding_box
+        # 물방울 흩뿌리기
+        # num_spheres = np.random.randint(2, 8)
+        # droplet_bound = half_domain - 0.1
+        # for _ in range(num_spheres):
+        #     p = np.random.uniform(-droplet_bound, droplet_bound, 3)
+        #     r = np.random.uniform(0.02, 0.08) # 큰 도형들에 묻히지 않게 물방울도 살짝 키움
+        #     s = sphere(r).translate(p)
+        #     final_sdf = final_sdf | s  
                         
         return final_sdf
 

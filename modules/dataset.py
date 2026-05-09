@@ -212,3 +212,108 @@ class SDFDataset(Dataset):
         target_tensor = torch.tensor(target_patch_flat, dtype=torch.float32)
         
         return input_tensor, target_tensor
+    
+    @staticmethod
+    def generate_dataset(
+        output_dir: str = "dataset4",
+        dataset_size: int = 50,
+        start_index: int = 0,
+        save_sdf: bool = True,
+        save_particles: bool = True,
+        save_mc: bool = False,
+        config = None,
+        device = 'cpu',
+        cleanup_old_files: bool = False
+    ):
+        """
+        학습용 SDF 데이터셋을 일괄 생성하고 저장하는 유틸리티 함수입니다.
+        
+        Args:
+            output_dir: 데이터셋을 저장할 폴더 경로
+            dataset_size: 총 생성할 데이터의 개수
+            start_index: 생성을 시작할 인덱스 (이어서 생성할 때 유용)
+            save_sdf: SDF 그리드(.npy) 저장 여부
+            save_particles: 원본 파티클 좌표(.npy) 저장 여부
+            save_mc: 모델 입력용 특징맵 m_c 그리드(.npy) 연산 및 저장 여부
+            config: 전역 설정 (resolution, domain_size 등)
+            device: 연산 디바이스 (m_c 계산 시 필요)
+            cleanup_old_files: True일 경우 기존 폴더 내의 .npy 파일을 모두 삭제 후 시작
+        """       
+        
+        import os
+        import glob
+        import numpy as np
+        import torch
+        
+        from modules.sdf_generator import SDFGenerator
+        from modules.sdf_network import FeatureConstruction
+        from modules.particle_sampler import sample_particles_poisson
+
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 1. 기존 파일 정리 (옵션)
+        if cleanup_old_files:
+            old_files = glob.glob(os.path.join(output_dir, "*.npy"))
+            for f in old_files:
+                os.remove(f)
+                print(f"🗑️ Removed old dataset file: {f}")
+
+        # 2. PPC(Particles Per Cell) 리스트 준비 (1, 2, 3, 4 골고루 섞기)
+        # dataset_size가 4의 배수가 아니어도 에러가 나지 않도록 넉넉하게 만든 뒤 자릅니다.
+        ppc_list = [1, 2, 3, 4] * ((dataset_size // 4) + 1)
+        ppc_list = ppc_list[:dataset_size]
+        np.random.shuffle(ppc_list)
+
+        # 3. 제너레이터 초기화
+        generator = SDFGenerator(config)
+        feature_constructor = None
+        
+        # mc_grid를 저장해야 할 때만 무거운 FeatureConstruction을 메모리에 올립니다.
+        if save_mc:
+            feature_constructor = FeatureConstruction(dx=config.dx, device=device)
+
+        print(f"\n🚀 Generating {dataset_size - start_index} training samples in '{output_dir}'...")
+        print(f"   [Options] SDF: {save_sdf} | Particles: {save_particles} | m_c Grid: {save_mc}")
+
+        # 4. 본격적인 데이터 생성 루프
+        for i in range(start_index, dataset_size):
+            current_ppc = ppc_list[i]
+            print(f"\n[{i+1}/{dataset_size}] Generating shape... (Target PPC: {current_ppc})")
+            
+            saved_files = []
+            
+            # [단계 A] SDF 생성
+            random_shape = generator.create_random_shape(seed=42 + i)
+            sdf_grid = generator.to_grid(random_shape)
+            
+            if save_sdf:
+                sdf_filename = os.path.join(output_dir, f"sdf_grid_{i:03d}.npy")
+                np.save(sdf_filename, sdf_grid)
+                saved_files.append("SDF")
+            
+            # 파티클이나 mc가 필요할 때만 파티클 샘플링 진행
+            if save_particles or save_mc:
+                print(f"  Sampling particles with PPC={current_ppc}...")
+                particles = sample_particles_poisson(sdf_grid, config, target_ppc=current_ppc)
+                
+                if save_particles:
+                    particles_filename = os.path.join(output_dir, f"particles_{i:03d}.npy")
+                    np.save(particles_filename, particles)
+                    saved_files.append("Particles")
+                
+                # [단계 B] m_c 특징맵 계산 및 저장
+                if save_mc:
+                    print("  Calculating m_c features...")
+                    particles_tensor = torch.tensor(particles, dtype=torch.float32, device=device)
+                    # 모델 추론이나 학습과 동일한 로직으로 m_c 계산
+                    with torch.no_grad():
+                        grid_nodes, m_c, grid_shape = feature_constructor(particles_tensor)
+                    mc_grid = m_c.reshape(grid_shape).cpu().numpy()
+                    
+                    mc_filename = os.path.join(output_dir, f"mc_grid_{i:03d}.npy")
+                    np.save(mc_filename, mc_grid)
+                    saved_files.append("m_c")
+            
+            print(f"  ✅ Saved: {', '.join(saved_files)} (Index: {i:03d})")
+
+        print(f"\n🎉 Dataset generation complete! All requested files are ready in '{output_dir}'.")
