@@ -60,8 +60,9 @@ def draw_sdf_mesh(ax, sdf_grid, domain_size=2.0, level=0, color='skyblue', alpha
 def draw_particles(ax, particles, color='orange', size=3, max_show=2000):
     """3D 축에 파티클을 그림"""
     if particles is None or len(particles) == 0: return
+    step = max(1, len(particles) // max_show) if len(particles) > max_show else 1
+    p_show = particles[::step]
     
-    p_show = particles[::(len(particles)//max_show)] if len(particles) > max_show else particles
     ax.scatter(p_show[:, 0], p_show[:, 1], p_show[:, 2], 
                s=size, c=color, alpha=0.8, label=f'Particles ({len(particles)})')
 
@@ -213,6 +214,77 @@ def view_obj_interactive(filename="output.obj"):
     except Exception as e:
         print(f"❌ 뷰어 실행 중 오류 발생: {e}")
 
+        
+def view_obj_and_particles_interactive(filename="output.obj", particles=None, resolution=128, domain_size=2.0):
+    """
+    OBJ 메쉬를 월드 좌표로 실시간 변환하여 파티클과 함께 시각화합니다.
+    
+    Args:
+        filename: OBJ 파일 경로 (0 ~ resolution-1 좌표계)
+        particles: 파티클 데이터 (N, 3) - (-1 ~ 1 좌표계 권장)
+        resolution: SDF 그리드 해상도 (기본값 128)
+        domain_size: 실제 월드 도메인 크기 (기본값 2.0)
+    """
+    if not os.path.exists(filename):
+        print(f"❌ 파일을 찾을 수 없습니다: {filename}")
+        return
+
+    print(f"🖥️ 3D 뷰어 실행 중 (실시간 좌표 변환 적용): {filename} ...")
+    
+    try:
+        geometries = []
+
+        # 1. 메쉬 로드
+        mesh = o3d.io.read_triangle_mesh(filename)
+        
+        # 🚨 [핵심] 메쉬 정점 좌표 변환 (Index Space -> World Space)
+        # verts_world = (verts / (resolution - 1)) * domain_size - (domain_size / 2.0)
+        verts = np.asarray(mesh.vertices)
+        
+        # 유저님이 요청하신 공식 적용
+        verts_world = (verts / (resolution - 1)) * domain_size - (domain_size / 2.0)
+        
+        # 변환된 좌표를 다시 메쉬에 주입
+        mesh.vertices = o3d.utility.Vector3dVector(verts_world)
+        
+        # 좌표가 바뀌었으므로 법선 벡터(Normals)를 다시 계산해야 쉐이딩이 깨지지 않습니다.
+        mesh.compute_vertex_normals()
+        mesh.paint_uniform_color([0.7, 0.7, 0.7]) 
+        geometries.append(mesh)
+
+        # 2. 파티클 세팅
+        if particles is not None:
+            if hasattr(particles, 'cpu'):
+                particles_np = particles.cpu().numpy()
+            else:
+                particles_np = np.array(particles)
+                
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(particles_np)
+            
+            # 파티클 색상 (밝은 파란색)
+            colors = np.zeros_like(particles_np)
+            colors[:, 0], colors[:, 1], colors[:, 2] = 0.1, 0.5, 1.0
+            pcd.colors = o3d.utility.Vector3dVector(colors)
+            
+            geometries.append(pcd)
+            print(f"✅ 파티클 {len(particles_np):,}개 정렬 완료.")
+
+        # 3. 좌표축 및 렌더링
+        coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3, origin=[0, 0, 0])
+        geometries.append(coord_frame)
+        
+        print(f"🔍 메쉬 범위 확인: {verts_world.min():.2f} ~ {verts_world.max():.2f}")
+        
+        o3d.visualization.draw_geometries(
+            geometries, 
+            window_name="On-the-fly Scaled SDF Viewer",
+            width=1024, height=768
+        )
+        
+    except Exception as e:
+        print(f"❌ 시각화 실패: {e}")
+
 
 # =========================================================
 # 4. SDF Network 시각화 함수들
@@ -309,7 +381,7 @@ def visualize_sdf(sdf_values: torch.Tensor,
     ax.set_title(title)
     plt.tight_layout()
     
-    plt.show()
+    # plt.show()
     return fig
 
 
@@ -347,18 +419,28 @@ def visualize_particles_and_features(particles: torch.Tensor,
     else:
         m_c_flat = m_c_grid.reshape(-1) if m_c_grid.ndim > 1 else m_c_grid
     
+    # 1. 색상 마스킹
+    mask = m_c_flat > 1e-5  
+    m_c_filtered = m_c_flat[mask]
+
+    # 2. 좌표 변환
     grid_nodes_np = grid_nodes.cpu().numpy() if isinstance(grid_nodes, torch.Tensor) else grid_nodes
+    
+    # 🚨 [버그 수정] 좌표(x, y, z)에도 동일한 마스크를 씌워 개수를 13만 개로 일치시킵니다!
+    grid_nodes_filtered = grid_nodes_np[mask]
+
+    # 3. 렌더링
     scatter = ax.scatter(
-        grid_nodes_np[:, 0],
-        grid_nodes_np[:, 1],
-        grid_nodes_np[:, 2],
-        c=m_c_flat,
+        grid_nodes_filtered[:, 0], # 마스킹된 좌표 사용
+        grid_nodes_filtered[:, 1],
+        grid_nodes_filtered[:, 2],
+        c=m_c_filtered,            # 마스킹된 색상 사용
         cmap='viridis',
         s=3,
         alpha=0.1,
         label='Grid nodes'
     )
-    
+
     plt.colorbar(scatter, ax=ax, label='m_c value')
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
@@ -366,6 +448,6 @@ def visualize_particles_and_features(particles: torch.Tensor,
     ax.set_title(title)
     ax.legend()
     plt.tight_layout()
-    plt.show()
+    # plt.show()
     
     return fig

@@ -20,6 +20,32 @@ class SDFGenerator:
         s = sphere(0.8)
         c = cylinder(0.4)
         return s - c
+    
+    def create_multi_thickness_plates(self):
+        """
+        하나의 씬에 3가지 두께(Thin, Medium, Thick)의 판을 나란히 배치합니다.
+        무작위 회전을 배제하고 고정된 각도로 비틀어 Aliasing(계단 현상)을 정밀하게 비교합니다.
+        """
+        # 한 화면에 3개가 들어가야 하므로 너비를 약간 줄입니다.
+        width = 0.4  
+        height = 0.8
+        
+        # 1. 3가지 두께의 판 생성 및 X축으로 나란히 이동(Translation)
+        # 도메인이 -1 ~ 1 이므로, 왼쪽(-0.6), 중앙(0), 오른쪽(0.6)에 배치합니다.
+        plate_thin = box([width, height, 0.01]).translate([-0.6, 0, 0])
+        plate_medium = box([width, height, 0.04]) # 중앙은 이동하지 않음
+        plate_thick = box([width, height, 0.15]).translate([0.6, 0, 0])
+        
+        # 2. 세 개의 판을 하나의 SDF 덩어리로 합치기 (Union)
+        combined_plates = plate_thin | plate_medium | plate_thick
+        
+        # 3. 고정된 각도로 그룹 전체를 동일하게 회전
+        # 딱 보기 좋게 대각선으로 30도 정도 비틀어줍니다. (난수 사용 X)
+        axis = np.array([1.0, 1.0, 0.2])
+        axis = axis / np.linalg.norm(axis)
+        final_shape = combined_plates.rotate(30, axis)
+        
+        return final_shape
 
     def create_random_shape(self, seed=None):
         """
