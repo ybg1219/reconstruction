@@ -451,3 +451,82 @@ def visualize_particles_and_features(particles: torch.Tensor,
     # plt.show()
     
     return fig
+
+
+# =========================================================
+# 5. Fluid 시각화 함수들
+# =========================================================
+
+import open3d as o3d
+import taichi as ti
+import numpy as np
+
+def run_realtime_visualizer(solver, window_name="Taichi MPM88 Fluid Simulator", point_size=3.5):
+    """
+    미리 세팅된 TaichiFluidSolver 객체를 받아 Open3D로 실시간 시각화를 수행합니다.
+    """
+    print(f"\n🖥️ Open3D 실시간 유체 시뮬레이터 가동 중... ({window_name})")
+    print("💡 [팁] 마우스 드래그: 회전 | 휠: 확대/축소 | Shift + '+' / '-': 점 크기 조절")
+
+    # 1. 렌더링에 필요한 파라미터 추출
+    num_particles = solver.get_active_particle_count()
+    half_d = solver.domain_size / 2.0
+
+    # 2. Open3D 기하 구조(Geometry) 초기화
+    pcd = o3d.geometry.PointCloud()
+    
+    # 파티클 복사용 임시 Taichi 필드 생성
+    tmp_field = ti.Vector.field(3, dtype=ti.f32, shape=solver.max_particles)
+    
+    # 초기 위치 획득
+    solver.copy_positions_to_field(tmp_field)
+    init_pos = tmp_field.to_numpy()[:num_particles]
+    pcd.points = o3d.utility.Vector3dVector(init_pos)
+
+    # 파티클 색상 부여 (아쿠아 블루 톤)
+    colors = np.zeros_like(init_pos)
+    colors[:, 0], colors[:, 1], colors[:, 2] = 0.1, 0.6, 1.0
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    # 월드 도메인 경계 박스 생성
+    bbox = o3d.geometry.AxisAlignedBoundingBox(
+        min_bound=[-half_d, -half_d, -half_d], 
+        max_bound=[half_d, half_d, half_d]
+    )
+    bbox.color = (0.5, 0.5, 0.5)
+
+    # 좌표축 추가
+    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3, origin=[0, 0, 0])
+
+    # 3. 매 프레임 실행될 실시간 애니메이션 콜백
+    def animation_callback(vis):
+        # A. 시뮬레이션 1스텝 연산
+        solver.step()
+        
+        # B. 업데이트된 위치 가져오기
+        solver.copy_positions_to_field(tmp_field)
+        current_pos = tmp_field.to_numpy()[:num_particles]
+        
+        # C. 뷰어 데이터 갱신
+        pcd.points = o3d.utility.Vector3dVector(current_pos)
+        vis.update_geometry(pcd)
+        vis.update_renderer()
+        return False
+
+    # 4. Open3D Visualizer 윈도우 생성 및 실행
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name=window_name, width=1280, height=720)
+    
+    vis.add_geometry(pcd)
+    vis.add_geometry(bbox)
+    vis.add_geometry(coord_frame)
+    
+    # 렌더링 옵션 (점 크기 및 뒷면 그리기)
+    opt = vis.get_render_option()
+    opt.point_size = point_size
+    opt.mesh_show_back_face = True
+    
+    # 콜백 등록 및 루프 실행
+    vis.register_animation_callback(animation_callback)
+    vis.run()
+    vis.destroy_window()

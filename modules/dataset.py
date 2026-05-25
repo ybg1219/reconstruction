@@ -317,3 +317,136 @@ class SDFDataset(Dataset):
             print(f"  ✅ Saved: {', '.join(saved_files)} (Index: {i:03d})")
 
         print(f"\n🎉 Dataset generation complete! All requested files are ready in '{output_dir}'.")
+
+
+        @staticmethod
+    def generate_dataset(
+        output_dir: str = "dataset_fluid",
+        dataset_size: int = 40,      # 총 생성할 프레임(샘플) 수
+        start_index: int = 0,
+        save_sdf: bool = True,
+        save_particles: bool = True,
+        save_mc: bool = True,
+        config = None,               # resolution, dx, domain_size 포함 필수
+        device = 'cpu',
+        cleanup_old_files: bool = False
+    ):
+        """
+        Taichi 유체 시뮬레이션을 돌려 실시간 파티클을 뽑고, 
+        이를 256(또는 설정된) 해상도의 SDF 및 mc 특징맵으로 변환하여 데이터셋을 빌드합니다.
+        """
+        from modules.sdf_network import FeatureConstruction # 기존 유저님의 모듈명에 맞게 조절
+
+        os.makedirs(output_dir, exist_ok=True)
+        
+        if cleanup_old_files:
+            old_files = glob.glob(os.path.join(output_dir, "*.npy"))
+            for f in old_files:
+                os.remove(f)
+                print(f"🗑️ Removed old dataset file: {f}")
+
+        # 1. 전역 파라미터 세팅
+        res = config.resolution  # 예: 256
+        dx = config.domain_size / res
+        
+        # 2. Taichi 필드 정의 (파티클 크기와 격자 해상도 매핑용)
+        # 테스트용 시뮬레이션을 위한 최대 파티클 수 정의 (예: 10만개)
+        max_particles = 150000
+        particle_positions = ti.Vector.field(3, dtype=ti.f32, shape=max_particles)
+        num_particles_active = ti.field(dtype=ti.i32, shape=())
+        
+        # SDF 연산용 Taichi 필드
+        sdf_field = ti.field(dtype=ti.f32, shape=(res, res, res))
+
+        # 3. 🧪 [Taichi Kernel] 파티클 기반 SDF 그리드 연산 알고리즘
+        # 유체 입자의 영향 반경(Radius) 내의 격자들에 거리를 주입합니다.
+        @ti.kernel
+        def compute_sdf_from_particles(p_radius: ti.f32, domain_size: ti.f32):
+            # 그리드 초기화 (충분히 큰 값으로 초기화 후 최소 거리 매핑)
+            for i, j, k in sdf_field:
+                sdf_field[i, j, k] = 2.0 # Max boundary bound
+
+            half_domain = domain_size / 2.0
+            num_p = num_particles_active[None]
+            
+            # 모든 격자점에서 파티클들을 순회하며 유체 표면(SDF=0) 레이어 계산
+            for i, j, k in sdf_field:
+                # 격자 인덱스를 월드 좌표계(-domain_size/2 ~ domain_size/2)로 복원
+                g_x = (i / (res - 1)) * domain_size - half_domain
+                g_y = (j / (res - 1)) * domain_size - half_domain
+                g_z = (k / (res - 1)) * domain_size - half_domain
+                g_pos = ti.Vector([g_x, g_y, g_z])
+                
+                min_dist = 9999.0
+                for p_idx in range(num_p):
+                    p_pos = particle_positions[p_idx]
+                    dist = (g_pos - p_pos).norm()
+                    if dist < min_dist:
+                        min_dist = dist
+                
+                # 유체 입자 반경을 빼주어 유체 표면 안쪽은 음수(-), 바깥쪽은 양수(+)가 되도록 설계
+                sdf_field[i, j, k] = min_dist - p_radius
+
+        # 4. 🌊 [Taichi 솔버 엔진 래퍼] 시뮬레이터 객체 정의
+        # 유저님의 실제 유체 엔진 코드가 들어가는 영역입니다. (여기서는 모크 업 샘플 솔버 구동)
+        from modules.taichi_fluid_solver import TaichiFluidSolver # 가정용 솔버
+        solver = TaichiFluidSolver(res=res, domain_size=config.domain_size)
+        solver.setup_initial_fluid_block() # 초기 유체 댐 브레이크 등 세팅
+
+        # mc_constructor 장착
+        feature_constructor = None
+        if save_mc:
+            feature_constructor = FeatureConstruction(dx=config.dx, device=device)
+
+        print(f"\n🚀 Launching Taichi Fluid Simulator for Dataset Generation...")
+        print(f"   [Target Frames]: {dataset_size - start_index} | Resolution: {res}^3")
+
+        # 5. 프레임 시뮬레이션 및 데이터 추출 루프
+        for frame in range(start_index, dataset_size):
+            print(f"\n[{frame+1}/{dataset_size}] Simulating & Extracting Fluid State...")
+            
+            # 유체 1스텝 전진 (내부적으로 파티클들이 움직임)
+            solver.step() 
+            
+            # 솔버 내부 GPU 파티클 데이터를 획득하여 데이터셋 필드로 전송
+            num_active = solver.get_active_particle_count()
+            num_particles_active[None] = num_active
+            solver.copy_positions_to_field(particle_positions)
+            
+            # 파티클 넘파이 어레이 백업 (World Space 좌표계)
+            raw_particles_np = particle_positions.to_numpy()[:num_active]
+
+            saved_files = []
+
+            # [단계 A] 파티클 -> SDF 필드 병렬 구이 실행
+            fluid_particle_radius = dx * 1.2 # 복셀 크기의 1.2배를 유체 입자 두께로 가정
+            compute_sdf_from_particles(fluid_particle_radius, config.domain_size)
+            sdf_grid = sdf_field.to_numpy()
+
+            if save_sdf:
+                sdf_filename = os.path.join(output_dir, f"sdf_grid_{frame:03d}.npy")
+                np.save(sdf_filename, sdf_grid)
+                saved_files.append("SDF")
+
+            if save_particles:
+                particles_filename = os.path.join(output_dir, f"particles_{frame:03d}.npy")
+                np.save(particles_filename, raw_particles_np)
+                saved_files.append("Particles")
+
+            # [단계 B] m_c 격자 특징맵 연산 (PyTorch 연결 파트)
+            if save_mc:
+                # 월드 스케일의 파티클 텐서화
+                particles_tensor = torch.tensor(raw_particles_np, dtype=torch.float32, device=device)
+                
+                with torch.no_grad():
+                    # FeatureConstruction 클래스를 활용한 다항식 가중치 주입 행렬 도출
+                    grid_nodes, m_c, grid_shape = feature_constructor(particles_tensor)
+                
+                mc_grid = m_c.reshape(grid_shape).cpu().numpy()
+                mc_filename = os.path.join(output_dir, f"mc_grid_{frame:03d}.npy")
+                np.save(mc_filename, mc_grid)
+                saved_files.append("m_c Grid")
+
+            print(f"   ✅ Saved Frame {frame:03d}: {', '.join(saved_files)} (Particles: {num_active:,})")
+
+        print(f"\n🎉 Fluid Dataset successfully generated in '{output_dir}'!")
