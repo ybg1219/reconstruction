@@ -3,7 +3,7 @@ import numpy as np
 
 @ti.data_oriented
 class TaichiFluidSolver:
-    def __init__(self, res=256, domain_size=2.0, particles = 100000):
+    def __init__(self, res=256, domain_size=2.0, particles = 200000):
         self.res = res
         self.domain_size = domain_size
         
@@ -15,7 +15,7 @@ class TaichiFluidSolver:
         self.gravity = 9.8            # 중력 가속도
 
         # Lame parameters (유체의 점성 및 탄성 조절)
-        self.E = 400.0
+        self.E = 2000.0
         self.nu = 0.2
         self.mu_0, self.lambda_0 = self.E / (2 * (1 + self.nu)), self.E * self.nu / ((1 + self.nu) * (1 - 2 * self.nu))
 
@@ -74,18 +74,19 @@ class TaichiFluidSolver:
         """
         for i in range(self.num_particles[None]):
             target_field[i] = self.p_x[i]
-
-    def step(self):
+def step(self):
         """
-        서브스텝을 여러 번 쪼개어 돌림으로써 고해상도 시뮬레이션의 물리적 안정성을 확보합니다.
+        시뮬레이션의 안정성과 현실적인 유체 거동을 위해 
+        하나의 프레임을 여러 서브스텝으로 나누어 물리 연산을 수행합니다.
         """
-        substeps = 20
+        substeps = 150
         for _ in range(substeps):
             self._substep()
 
     @ti.kernel
     def _substep(self):
-        # 1) 격자 초기화
+        # 1. 그리드 초기화 (Grid Initialization)
+        # 매 서브스텝마다 그리드의 속도와 질량을 0으로 초기화합니다.
         for i, j, k in self.g_m:
             self.g_v[i, j, k] = ti.Vector([0.0, 0.0, 0.0])
             self.g_m[i, j, k] = 0.0
@@ -94,43 +95,49 @@ class TaichiFluidSolver:
         p_vol = self.dx ** 3
         p_mass = p_vol * self.rho
 
-        # 2) P2G (Particle to Grid): 파티클의 질량과 운동량을 격자로 전송 및 압력/점성 계산
+        # 2. 입자에서 그리드로 전송 (Particle to Grid, P2G)
+        # 입자의 질량과 운동량을 주변 3x3x3 그리드 노드로 분배합니다.
         for p in range(self.num_particles[None]):
-            # 월드 좌표를 격자 인덱스 스페이스로 매핑
             base = ((self.p_x[p] + half_d) * self.inv_dx - 0.5).cast(int)
             fx = (self.p_x[p] + half_d) * self.inv_dx - base.cast(ti.f32)
             
             # Quadratic B-spline 커널 가중치 계산
             w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1.0) ** 2, 0.5 * (fx - 0.5) ** 2]
             
-            # 유체 연속성 물질 대수 연산 (Neo-Hookean 약화식)
-            self.p_F[p] = (ti.Matrix.identity(ti.f32, 3) + self.dt * self.p_C[p]) @ self.p_F[p]
-            h = ti.max(0.1, ti.min(5.0, ti.exp(1.0 * (self.p_J[p] - 1.0))))
-            if self.p_J[p] < 1.0: h = self.p_J[p]
-            
-            stress = self.mu_0 * (self.p_F[p] @ self.p_F[p].transpose() - ti.Matrix.identity(ti.f32, 3)) + self.lambda_0 * (self.p_J[p] - 1.0) * h * ti.Matrix.identity(ti.f32, 3)
+            # 유체 특성 적용: 형태(F) 복원력을 배제하고 부피 변화율(J)만 누적
+            self.p_J[p] = (1.0 + self.dt * self.p_C[p].trace()) * self.p_J[p]
+
+            # 상태 방정식 (Equation of State): 부피 변화에 따른 압력 도출
+            pressure = self.E * (self.p_J[p] - 1.0)
+
+            # 응력 계산: 고체의 전단 응력을 제거하고 압력과 기본 점성만 적용
+            viscosity = 0.01
+            stress = ti.Matrix.identity(ti.f32, 3) * pressure + viscosity * self.p_C[p]
             eq_stress = -self.dt * p_vol * 4 * self.inv_dx ** 2 * stress
             affine = eq_stress + p_mass * self.p_C[p]
 
-            # 이웃 3x3x3 격자에 분배
+            # 주변 3x3x3 그리드에 가중치를 적용하여 물리량 누적
             for i, j, k in ti.static(ti.ndrange(3, 3, 3)):
                 offset = ti.Vector([i, j, k])
                 dpos = (offset.cast(ti.f32) - fx) * self.dx
                 weight = w[i].x * w[j].y * w[k].z
                 grid_idx = base + offset
                 
-                # 경계 조건 방어
+                # 도메인 인덱스 경계 방어
                 if 0 <= grid_idx.x < self.res and 0 <= grid_idx.y < self.res and 0 <= grid_idx.z < self.res:
                     self.g_v[grid_idx] += weight * (p_mass * self.p_v[p] + affine @ dpos)
                     self.g_m[grid_idx] += weight * p_mass
 
-        # 3) 격자 업데이트 (중력 반영 및 보더 벽면 충돌 처리)
+        # 3. 그리드 속도 업데이트 (외력 적용 및 경계 조건 처리)
         for i, j, k in self.g_m:
             if self.g_m[i, j, k] > 0:
+                # 운동량을 질량으로 나누어 속도 도출
                 self.g_v[i, j, k] /= self.g_m[i, j, k]
-                self.g_v[i, j, k].y -= self.gravity * self.dt # 외력: 중력 추가
+                
+                # 중력 적용
+                self.g_v[i, j, k].y -= self.gravity * self.dt
 
-                # 도메인 외벽 충돌 처리
+                # 도메인 외벽 경계 조건 (Boundary Conditions) 처리
                 boundary = 3
                 if i < boundary and self.g_v[i, j, k].x < 0: self.g_v[i, j, k].x = 0
                 if i > self.res - boundary and self.g_v[i, j, k].x > 0: self.g_v[i, j, k].x = 0
@@ -139,14 +146,15 @@ class TaichiFluidSolver:
                 if k < boundary and self.g_v[i, j, k].z < 0: self.g_v[i, j, k].z = 0
                 if k > self.res - boundary and self.g_v[i, j, k].z > 0: self.g_v[i, j, k].z = 0
 
-        # 4) G2P (Grid to Particle): 격자 물리량을 다시 파티클로 역주입 및 위치 전진
+        # 4. 그리드에서 입자로 환원 (Grid to Particle, G2P)
+        # 그리드의 속도장을 바탕으로 입자의 속도와 위치를 업데이트합니다.
         for p in range(self.num_particles[None]):
             base = ((self.p_x[p] + half_d) * self.inv_dx - 0.5).cast(int)
             fx = (self.p_x[p] + half_d) * self.inv_dx - base.cast(ti.f32)
             w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1.0) ** 2, 0.5 * (fx - 0.5) ** 2]
             
             new_v = ti.Vector([0.0, 0.0, 0.0])
-            new_C = ti.Matrix([ [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0] ])
+            new_C = ti.Matrix([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
             
             for i, j, k in ti.static(ti.ndrange(3, 3, 3)):
                 offset = ti.Vector([i, j, k])
@@ -160,5 +168,5 @@ class TaichiFluidSolver:
                     new_C += 4 * self.inv_dx ** 2 * weight * g_v_val.outer_product(dpos)
 
             self.p_v[p] = new_v
-            self.p_x[p] += self.dt * self.p_v[p] # 파티클 전진!
+            self.p_x[p] += self.dt * self.p_v[p]
             self.p_C[p] = new_C
