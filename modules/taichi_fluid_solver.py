@@ -1,10 +1,15 @@
 import taichi as ti
 import numpy as np
 import math
+import os
+import glob
+import torch
+from modules.sdf_network import FeatureConstruction
+
 
 @ti.data_oriented
 class TaichiFluidSolver:
-    def __init__(self, res=128, domain_size=2.0, max_particles=400000, p_per_cell=2.0):
+    def __init__(self, res=128, domain_size=2.0, max_particles=400000, p_per_cell=1.0):
         self.domain_size = domain_size
         self.max_particles = max_particles
         self.res = res
@@ -29,18 +34,18 @@ class TaichiFluidSolver:
         self.rho0 = 1000.0
 
         # 압력 강성 (너무 크면 폭발)
-        self.stiffness = 500.0
+        self.stiffness = 150.0
 
         # 점성 (충분히 줘야 안정됨)
-        self.viscosity = 0.03
+        self.viscosity = 0.005
 
         # 시간 스텝 (SPH 안정 핵심)
         self.dt = 0.001
-        self.surface_tension = 0.1
+        self.surface_tension = 0.02
         self.gravity = ti.Vector([0.0, -9.8, 0.0])
 
         # smoothing length (spacing 기준으로 고정)
-        self.h = self.spacing * 1.6
+        self.h = self.spacing * 1.4
         self.h2 = self.h * self.h
 
         # particle mass
@@ -89,6 +94,11 @@ class TaichiFluidSolver:
         X, Y, Z = np.meshgrid(x_range, y_range, z_range)
         positions = np.stack([X.flatten(), Y.flatten(), Z.flatten()], axis=-1).astype(np.float32)
 
+        # jitter initial particles
+        jitter = self.spacing * 0.1
+        noise = np.random.uniform(-jitter, jitter, positions.shape).astype(np.float32)
+        positions += noise
+        
         p_count = len(positions)
 
         if p_count > self.max_particles:
@@ -109,6 +119,11 @@ class TaichiFluidSolver:
     
     def get_active_particle_count(self):
         return self.num_particles[None]
+    
+    @ti.kernel
+    def copy_positions_to_field(self, target_field: ti.template()):
+        for i in range(self.num_particles[None]):
+            target_field[i] = self.p_x[i]
 
     # =========================================================
     # Grid utilities
@@ -198,9 +213,10 @@ class TaichiFluidSolver:
     @ti.kernel
     def compute_forces_and_integrate(self):
         half_d = self.domain_size / 2.0
-        boundary_min = -half_d + self.particle_radius
-        boundary_max = half_d - self.particle_radius
-
+        padding = 0.1  
+        boundary_min = -half_d + padding + self.particle_radius
+        boundary_max = half_d - padding - self.particle_radius
+        
         for i in range(self.num_particles[None]):
             pos_i = self.p_x[i]
             vel_i = self.p_v[i]
@@ -253,9 +269,6 @@ class TaichiFluidSolver:
             
             # integrate
             vel_i += self.dt * acc
-
-            # damping (SPH stability 핵심)
-            vel_i *= 0.9995
             
             pos_i += self.dt * vel_i
 
@@ -263,11 +276,18 @@ class TaichiFluidSolver:
             for d in ti.static(range(3)):
                 if pos_i[d] < boundary_min:
                     pos_i[d] = boundary_min
-                    vel_i[d] *= -0.6
+                    vel_i[d] *= -0.7
+                    
+                    vel_i[(d + 1) % 3] *= 0.999
+                    vel_i[(d + 2) % 3] *= 0.999
+                    
                 elif pos_i[d] > boundary_max:
                     pos_i[d] = boundary_max
-                    vel_i[d] *= -0.6
+                    vel_i[d] *= -0.7
 
+                    vel_i[(d + 1) % 3] *= 0.999
+                    vel_i[(d + 2) % 3] *= 0.999
+                
             self.p_v[i] = vel_i
             self.p_x[i] = pos_i
 
@@ -294,7 +314,7 @@ class TaichiFluidSolver:
         camera.up(0.0, 1.0, 0.0)
         
         paused = False
-        frame_count = 0
+        frame_count = 0  # 프레임 카운터 초기화
         
         while window.running:
             if window.get_event(ti.ui.PRESS):
@@ -302,15 +322,13 @@ class TaichiFluidSolver:
                     paused = not paused
                 elif window.event.key == 'r':
                     self.setup_initial_fluid_block()
+                    frame_count = 0  # R키를 누르면 프레임도 다시 0으로 초기화
             
             if not paused:
                 self.step()
                 self.update_colors()
+                frame_count += 1  # 시뮬레이션이 진행될 때만 프레임 증가
             
-            # 🔥 [최적화 9] Visualization 병목 최소화
-            # 매 프레임 그리지 않고 씬 업데이트는 그대로 두되 물리 연산 비중을 늘림
-            # (위의 self.step() 내부 substep 개수를 조절하는 것으로 이미 해결됨)
-
             camera.track_user_inputs(window, movement_speed=0.03, hold_key=ti.ui.RMB)
             scene.set_camera(camera)
             scene.ambient_light((0.6, 0.6, 0.6))
@@ -324,9 +342,27 @@ class TaichiFluidSolver:
             )
             
             canvas.scene(scene)
+
+            # =========================================================
+            # 상태창 GUI 추가
+            # =========================================================
+            gui = window.get_gui()
+            # 좌측 상단(x: 0.05, y: 0.05)에 너비 0.2, 높이 0.1 크기의 패널 생성
+            with gui.sub_window("Simulation Status", 0.05, 0.05, 0.2, 0.12):
+                gui.text(f"Current Frame: {frame_count}")
+                gui.text(f"Active Particles: {self.num_particles[None]:,}")
+                if paused:
+                    gui.text("Status: PAUSED")
+                else:
+                    gui.text("Status: RUNNING")
+            
             window.show()
             
-    
+            
+            
+    # =========================================================
+    # Dataset Generation & Utilities
+    # =========================================================
     @staticmethod
     def generate_dataset(
         output_dir: str = "dataset_fluid",
@@ -335,7 +371,7 @@ class TaichiFluidSolver:
         save_sdf: bool = True,
         save_particles: bool = True,
         save_mc: bool = True,
-        config = None,               # resolution, dx, domain_size 포함 필수
+        config = None,               # resolution, domain_size 포함 필수
         device = 'cpu',
         cleanup_old_files: bool = False
     ):
@@ -365,7 +401,8 @@ class TaichiFluidSolver:
         # 3. 모델 특징맵(m_c) 추출기 초기화
         feature_constructor = None
         if save_mc:
-            feature_constructor = FeatureConstruction(dx=config.dx, device=device)
+            # config.dx 대신 위에서 계산한 dx 사용
+            feature_constructor = FeatureConstruction(dx=dx, device=device)
 
         print(f"\n🚀 Launching Optimized Fluid Simulator Pipeline...")
         print(f"   [Target Frames]: {dataset_size - start_index} | Resolution: {res}^3")
@@ -386,12 +423,12 @@ class TaichiFluidSolver:
 
             # [단계 B] 파티클 -> SDF 필드 초고속 변환 (Spatial Hash Gather 적용)
             if save_sdf:
-                # 💡 이중 루프 대신, 최적화된 모듈 함수를 호출합니다.
-                sdf_grid = convert_particles_to_sdf(
+                # 🔥 수정: 정적 메서드 호출 시 클래스명 명시
+                sdf_grid = TaichiFluidSolver.convert_particles_to_sdf(
                     particles_np=raw_particles_np,
                     res=res,
                     domain_size=config.domain_size,
-                    radius_ratio=1.5 # 파티클 두께 조절 (필요시 튜닝)
+                    radius_ratio=1.25 # 파티클 두께 조절 (필요시 튜닝)
                 )
                 
                 sdf_filename = os.path.join(output_dir, f"sdf_grid_{frame:03d}.npy")
@@ -416,6 +453,9 @@ class TaichiFluidSolver:
                 mc_filename = os.path.join(output_dir, f"mc_grid_{frame:03d}.npy")
                 np.save(mc_filename, mc_grid)
                 saved_files.append("m_c Grid")
+                
+                del particles_tensor, grid_nodes, m_c
+                torch.cuda.empty_cache()
 
             print(f"   ✅ Saved Frame {frame:03d}: {', '.join(saved_files)} (Particles: {num_active:,})")
 
@@ -468,7 +508,7 @@ class TaichiFluidSolver:
         print(f"🎉 데이터셋 추출이 완료되었습니다! 총 {num_frames}개의 파일이 저장되었습니다.")
 
     @staticmethod
-    def convert_particles_to_sdf(particles_np, res=256, domain_size=2.0, radius_ratio=1.5):
+    def convert_particles_to_sdf(particles_np, res=256, domain_size=2.0, radius_ratio=1.0):
         """
         Numpy 파티클 배열을 입력받아 고해상도 SDF 그리드를 반환하는 래퍼 함수입니다.
         

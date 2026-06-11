@@ -48,6 +48,9 @@ def draw_sdf_mesh(ax, sdf_grid, domain_size=2.0, level=0, color='skyblue', alpha
         voxel_size = domain_size / (resolution - 1)
         verts_world = min_bound + verts * voxel_size
         
+        # y - z flip
+        verts_world[:, [1, 2]] = verts_world[:, [2, 1]]
+        
         mesh = Poly3DCollection(verts_world[faces], alpha=alpha)
         mesh.set_facecolor(color)
         mesh.set_edgecolor('gray')
@@ -63,7 +66,7 @@ def draw_particles(ax, particles, color='orange', size=3, max_show=2000):
     step = max(1, len(particles) // max_show) if len(particles) > max_show else 1
     p_show = particles[::step]
     
-    ax.scatter(p_show[:, 0], p_show[:, 1], p_show[:, 2], 
+    ax.scatter(p_show[:, 0], p_show[:, 2], p_show[:, 1], 
                s=size, c=color, alpha=0.8, label=f'Particles ({len(particles)})')
 
 # =========================================================
@@ -156,6 +159,7 @@ def visualize_simulation(sdf_grid=None, particles=None, domain_size=2.0, title="
     
     plt.tight_layout()
     plt.show()
+    return
 
 
 def visualize_npy(filepath, domain_size=2.0):
@@ -448,9 +452,7 @@ def visualize_particles_and_features(particles: torch.Tensor,
     ax.set_title(title)
     ax.legend()
     plt.tight_layout()
-    # plt.show()
-    
-    return fig
+    plt.show()
 
 
 # =========================================================

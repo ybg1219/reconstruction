@@ -11,10 +11,9 @@ class SDFDataset(Dataset):
     미리 계산된 SDF 그리드와 m_c 특징 그리드(.npy) 쌍을 불러와 
     8x8x8 슬라이딩 윈도우 패치(Patch) 단위로 분할하여 제공하는 학습 데이터셋.
     """
-    # 🚨 [수정됨] feature_constructor 파라미터 추가
     def __init__(self, data_dir="dataset", patch_size=8, in_memory=True, 
                  use_narrow_band=True, use_bg_sample=True, bg_sample_ratio=0.05,
-                 feature_constructor=None):
+                 feature_constructor=None, max_samples=None):
         super().__init__()
         self.patch_size = patch_size
         self.half_size = patch_size // 2
@@ -26,8 +25,8 @@ class SDFDataset(Dataset):
         
         self.sdf_files = sorted(glob.glob(os.path.join(data_dir, "sdf_grid*.npy")))
         self.mc_files = sorted(glob.glob(os.path.join(data_dir, "mc_grid*.npy")))
-        # 🚨 [추가됨] 파티클 파일도 검색합니다.
         self.particle_files = sorted(glob.glob(os.path.join(data_dir, "particles*.npy")))
+        self.max_samples = max_samples
         
         if len(self.sdf_files) == 0:
             print(f"⚠️ 경고: '{data_dir}' 경로에서 데이터셋 파일을 찾지 못했습니다.")
@@ -134,7 +133,11 @@ class SDFDataset(Dataset):
                 
         # 3. 모델이 편식하지 않도록(표면만 학습하다 배경만 학습하는 현상 방지) 최종 데이터 섞기
         random.shuffle(self.valid_samples)
-        
+        original_count = len(self.valid_samples)
+        if self.max_samples is not None and original_count > self.max_samples:
+            self.valid_samples = self.valid_samples[:self.max_samples]
+            print(f"✂️ [데이터 제한] 전체 {original_count:,}개 샘플 중 무작위 {self.max_samples:,}개만 선택되었습니다.")
+            
         self.total_samples = len(self.valid_samples)
         total_possible_nodes = self.num_shapes * self.num_nodes_per_shape
         
@@ -144,6 +147,7 @@ class SDFDataset(Dataset):
         if self.use_bg_sample:
             print(f"   - 배경(Background) 데이터: {total_bg}개 ({self.bg_sample_ratio*100}% 랜덤 추출)")
         print(f"   - 최종 학습 데이터: {self.total_samples}개 (전체 중 {(self.total_samples/total_possible_nodes)*100:.1f}%)")
+        
     def __len__(self):
         return self.total_samples
 
@@ -319,236 +323,3 @@ class SDFDataset(Dataset):
 
         print(f"\n🎉 Dataset generation complete! All requested files are ready in '{output_dir}'.")
 
-
-    @staticmethod
-    def generate_dataset(
-        output_dir: str = "dataset_fluid",
-        dataset_size: int = 40,      # 총 생성할 프레임(샘플) 수
-        start_index: int = 0,
-        save_sdf: bool = True,
-        save_particles: bool = True,
-        save_mc: bool = True,
-        config = None,               # resolution, dx, domain_size 포함 필수
-        device = 'cpu',
-        cleanup_old_files: bool = False
-    ):
-        """
-        Taichi 유체 시뮬레이션을 돌려 실시간 파티클을 뽑고, 
-        Spatial Hash 기반 초고속 SDF 변환 및 mc 특징맵을 추출하여 데이터셋을 빌드합니다.
-        """
-        os.makedirs(output_dir, exist_ok=True)
-        
-        if cleanup_old_files:
-            old_files = glob.glob(os.path.join(output_dir, "*.npy"))
-            for f in old_files:
-                os.remove(f)
-            print(f"🗑️ Removed {len(old_files)} old dataset files.")
-
-        # 1. 전역 파라미터 세팅
-        res = config.resolution  
-        dx = config.domain_size / res
-        
-        # 2. Taichi 유체 솔버 초기화
-        solver = TaichiFluidSolver(res=res, domain_size=config.domain_size)
-        solver.setup_initial_fluid_block() 
-        
-        # 파티클 획득용 임시 벡터 필드
-        tmp_particle_field = ti.Vector.field(3, dtype=ti.f32, shape=solver.max_particles)
-
-        # 3. 모델 특징맵(m_c) 추출기 초기화
-        feature_constructor = None
-        if save_mc:
-            feature_constructor = FeatureConstruction(dx=config.dx, device=device)
-
-        print(f"\n🚀 Launching Optimized Fluid Simulator Pipeline...")
-        print(f"   [Target Frames]: {dataset_size - start_index} | Resolution: {res}^3")
-
-        # 4. 프레임 시뮬레이션 및 데이터 추출 루프
-        for frame in range(start_index, dataset_size):
-            print(f"\n[{frame+1}/{dataset_size}] Simulating & Extracting Fluid State...")
-            
-            # [단계 A] 유체 1스텝 전진 (내부적으로 파티클 이동)
-            solver.step() 
-            
-            # 활성화된 파티클 Numpy 배열로 추출
-            num_active = solver.get_active_particle_count()
-            solver.copy_positions_to_field(tmp_particle_field)
-            raw_particles_np = tmp_particle_field.to_numpy()[:num_active]
-
-            saved_files = []
-
-            # [단계 B] 파티클 -> SDF 필드 초고속 변환 (Spatial Hash Gather 적용)
-            if save_sdf:
-                # 💡 이중 루프 대신, 최적화된 모듈 함수를 호출합니다.
-                sdf_grid = convert_particles_to_sdf(
-                    particles_np=raw_particles_np,
-                    res=res,
-                    domain_size=config.domain_size,
-                    radius_ratio=1.5 # 파티클 두께 조절 (필요시 튜닝)
-                )
-                
-                sdf_filename = os.path.join(output_dir, f"sdf_grid_{frame:03d}.npy")
-                np.save(sdf_filename, sdf_grid)
-                saved_files.append("SDF")
-
-            # [단계 C] 원본 파티클 저장
-            if save_particles:
-                particles_filename = os.path.join(output_dir, f"particles_{frame:03d}.npy")
-                np.save(particles_filename, raw_particles_np)
-                saved_files.append("Particles")
-
-            # [단계 D] m_c 격자 특징맵 연산 (PyTorch)
-            if save_mc:
-                particles_tensor = torch.tensor(raw_particles_np, dtype=torch.float32, device=device)
-                
-                with torch.no_grad():
-                    # Spatial Hash & Sort가 내장된 FeatureConstruction 가동
-                    grid_nodes, m_c, grid_shape = feature_constructor(particles_tensor)
-                
-                mc_grid = m_c.reshape(grid_shape).cpu().numpy()
-                mc_filename = os.path.join(output_dir, f"mc_grid_{frame:03d}.npy")
-                np.save(mc_filename, mc_grid)
-                saved_files.append("m_c Grid")
-
-            print(f"   ✅ Saved Frame {frame:03d}: {', '.join(saved_files)} (Particles: {num_active:,})")
-
-            # (선택) 다양성 확보를 위해 N 프레임마다 물방울 초기화 
-            # if (frame + 1) % 20 == 0:
-            #     solver.setup_initial_fluid_block()
-
-        print(f"\n🎉 Fluid Dataset successfully generated in '{output_dir}'!")
-
-    @staticmethod
-    def save_particles_to_npy(solver, output_dir="dataset_particles", num_frames=100):
-        """
-        Taichi 솔버를 구동하여 매 프레임의 파티클 위치를 .npy 파일로 저장합니다.
-        """
-        # 1. 저장 디렉토리 생성
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # 2. 파티클 데이터를 GPU에서 CPU(Numpy)로 가져오기 위한 임시 필드 생성
-        tmp_field = ti.Vector.field(3, dtype=ti.f32, shape=solver.max_particles)
-        
-        print(f"\n🚀 파티클 데이터셋 생성을 시작합니다...")
-        print(f"📂 저장 경로: {output_dir}")
-        print(f"🎞️ 총 프레임 수: {num_frames}개")
-        print("-" * 40)
-
-        # 3. 프레임 단위 시뮬레이션 및 저장 루프
-        for frame in range(num_frames):
-            # A. 시뮬레이션 1스텝 전진
-            solver.step()
-            
-            # B. 현재 활성화된 파티클 개수 확인
-            num_particles = solver.get_active_particle_count()
-            
-            # C. 솔버 내부의 파티클 위치를 임시 필드로 복사
-            solver.copy_positions_to_field(tmp_field)
-            
-            # D. Numpy 배열로 변환 및 유효한 파티클만 슬라이싱
-            # shape: (num_particles, 3)
-            particles_np = tmp_field.to_numpy()[:num_particles]
-            
-            # E. .npy 파일로 디스크에 저장
-            filename = os.path.join(output_dir, f"particles_{frame:04d}.npy")
-            np.save(filename, particles_np)
-            
-            # 10프레임마다 진행 상황 출력
-            if frame % 10 == 0 or frame == num_frames - 1:
-                print(f"   [Frame {frame:04d}/{num_frames}] 저장 완료 (활성 파티클: {num_particles:,}개)")
-                
-        print("-" * 40)
-        print(f"🎉 데이터셋 추출이 완료되었습니다! 총 {num_frames}개의 파일이 저장되었습니다.")
-
-    @staticmethod
-    def convert_particles_to_sdf(particles_np, res=256, domain_size=2.0, radius_ratio=1.5):
-        """
-        Numpy 파티클 배열을 입력받아 고해상도 SDF 그리드를 반환하는 래퍼 함수입니다.
-        
-        Args:
-            particles_np: (N, 3) 형태의 파티클 월드 좌표 배열
-            res: 변환할 SDF 그리드 해상도 (기본값 256)
-            domain_size: 시뮬레이션 물리 도메인 크기 (기본값 2.0)
-            radius_ratio: 하나의 유체 입자가 차지하는 두께 (기본 격자 크기 dx 대비 배수)
-        
-        Returns:
-            sdf_grid: (res, res, res) 형태의 Numpy SDF 배열
-        """
-        num_particles = len(particles_np)
-        if num_particles == 0:
-            print("⚠️ 파티클 데이터가 비어 있습니다. 빈 그리드를 반환합니다.")
-            return np.full((res, res, res), domain_size, dtype=np.float32)
-
-        # 출력용 빈 넘파이 배열 할당 (Taichi 커널에서 직접 덮어씀)
-        sdf_grid_np = np.empty((res, res, res), dtype=np.float32)
-        
-        # 유체 파티클 하나의 물리적 반경(두께) 계산
-        dx = domain_size / res
-        p_radius = dx * radius_ratio
-
-        # GPU 커널 가동
-        _compute_sdf_scatter_kernel(
-            particles=particles_np.astype(np.float32),
-            sdf_grid=sdf_grid_np,
-            num_particles=num_particles,
-            res=res,
-            domain_size=domain_size,
-            p_radius=p_radius
-        )
-
-        return sdf_grid_np
-    
-
-@ti.kernel
-def _compute_sdf_scatter_kernel(
-    particles: ti.types.ndarray(),
-    sdf_grid: ti.types.ndarray(),
-    num_particles: ti.i32,
-    res: ti.i32,
-    domain_size: ti.f32,
-    p_radius: ti.f32
-):
-    """
-    GPU 병렬 처리를 통해 각 파티클이 자신의 주변 격자에만 SDF 값을 기록하는 커널입니다.
-    """
-    half_d = domain_size / 2.0
-
-    # 1. SDF 그리드를 충분히 큰 양수(도메인 바깥 거리)로 초기화
-    for i, j, k in ti.ndrange(res, res, res):
-        sdf_grid[i, j, k] = domain_size
-
-    # 2. 파티클 관점에서 주변 격자 탐색 마진(칸 수) 계산
-    dx = domain_size / res
-    margin = ti.cast(ti.ceil(p_radius / dx), ti.i32) + 2
-
-    # 3. 모든 파티클을 병렬로 순회하며 주변 그리드에 최단 거리 갱신
-    for p in range(num_particles):
-        px = particles[p, 0]
-        py = particles[p, 1]
-        pz = particles[p, 2]
-
-        # 현재 파티클이 위치한 중심 격자 인덱스 도출
-        base_i = ti.cast(ti.round((px + half_d) / domain_size * (res - 1)), ti.i32)
-        base_j = ti.cast(ti.round((py + half_d) / domain_size * (res - 1)), ti.i32)
-        base_k = ti.cast(ti.round((pz + half_d) / domain_size * (res - 1)), ti.i32)
-
-        # 파티클 반경(margin)을 덮는 이웃 격자들만 부분적으로 루프 (Narrow Band)
-        for i_off in range(-margin, margin + 1):
-            for j_off in range(-margin, margin + 1):
-                for k_off in range(-margin, margin + 1):
-                    grid_i = base_i + i_off
-                    grid_j = base_j + j_off
-                    grid_k = base_k + k_off
-
-                    # 도메인 경계 내부에 있는 격자인지 확인
-                    if 0 <= grid_i < res and 0 <= grid_j < res and 0 <= grid_k < res:
-                        # 격자 노드의 정확한 월드 좌표 복원
-                        g_x = (grid_i / (res - 1.0)) * domain_size - half_d
-                        g_y = (grid_j / (res - 1.0)) * domain_size - half_d
-                        g_z = (grid_k / (res - 1.0)) * domain_size - half_d
-
-                        # 유클리디안 거리 계산 후 유체 반경(p_radius)을 빼서 SDF 도출
-                        dist = ti.sqrt((g_x - px)**2 + (g_y - py)**2 + (g_z - pz)**2) - p_radius
-                        
-                        # 🚨 병렬 스레드 충돌 방지를 위해 atomic_min 사용 (최단 거리만 남김)
-                        ti.atomic_min(sdf_grid[grid_i, grid_j, grid_k], dist)
