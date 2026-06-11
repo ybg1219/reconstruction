@@ -530,7 +530,7 @@ class TaichiFluidSolver:
         sdf_grid_np = np.empty((res, res, res), dtype=np.float32)
         
         # 유체 파티클 하나의 물리적 반경(두께) 계산
-        dx = domain_size / res
+        dx = domain_size / (res-1.0)
         p_radius = dx * radius_ratio
 
         # GPU 커널 가동
@@ -565,8 +565,8 @@ def _compute_sdf_scatter_kernel(
         sdf_grid[i, j, k] = domain_size
 
     # 2. 파티클 관점에서 주변 격자 탐색 마진(칸 수) 계산
-    dx = domain_size / res
-    margin = ti.cast(ti.ceil(p_radius / dx), ti.i32) + 2
+    dx = domain_size / (res - 1.0)
+    margin = int(p_radius / dx) + 1
 
     # 3. 모든 파티클을 병렬로 순회하며 주변 그리드에 최단 거리 갱신
     for p in range(num_particles):
@@ -575,9 +575,9 @@ def _compute_sdf_scatter_kernel(
         pz = particles[p, 2]
 
         # 현재 파티클이 위치한 중심 격자 인덱스 도출
-        base_i = ti.cast(ti.round((px + half_d) / domain_size * (res - 1)), ti.i32)
-        base_j = ti.cast(ti.round((py + half_d) / domain_size * (res - 1)), ti.i32)
-        base_k = ti.cast(ti.round((pz + half_d) / domain_size * (res - 1)), ti.i32)
+        base_i = int(ti.floor((px + half_d) / domain_size * (res - 1)))
+        base_j = int(ti.floor((py + half_d) / domain_size * (res - 1)))
+        base_k = int(ti.floor((pz + half_d) / domain_size * (res - 1)))
 
         # 파티클 반경(margin)을 덮는 이웃 격자들만 부분적으로 루프 (Narrow Band)
         for i_off in range(-margin, margin + 1):
@@ -587,15 +587,13 @@ def _compute_sdf_scatter_kernel(
                     grid_j = base_j + j_off
                     grid_k = base_k + k_off
 
-                    # 도메인 경계 내부에 있는 격자인지 확인
-                    if 0 <= grid_i < res and 0 <= grid_j < res and 0 <= grid_k < res:
-                        # 격자 노드의 정확한 월드 좌표 복원
-                        g_x = (grid_i / (res - 1.0)) * domain_size - half_d
-                        g_y = (grid_j / (res - 1.0)) * domain_size - half_d
-                        g_z = (grid_k / (res - 1.0)) * domain_size - half_d
+                    # 격자 노드의 정확한 월드 좌표 복원
+                    g_x = (grid_i / (res - 1.0)) * domain_size - half_d
+                    g_y = (grid_j / (res - 1.0)) * domain_size - half_d
+                    g_z = (grid_k / (res - 1.0)) * domain_size - half_d
 
-                        # 유클리디안 거리 계산 후 유체 반경(p_radius)을 빼서 SDF 도출
-                        dist = ti.sqrt((g_x - px)**2 + (g_y - py)**2 + (g_z - pz)**2) - p_radius
-                        
-                        # 🚨 병렬 스레드 충돌 방지를 위해 atomic_min 사용 (최단 거리만 남김)
-                        ti.atomic_min(sdf_grid[grid_i, grid_j, grid_k], dist)
+                    # 유클리디안 거리 계산 후 유체 반경(p_radius)을 빼서 SDF 도출
+                    dist = ti.sqrt((g_x - px)**2 + (g_y - py)**2 + (g_z - pz)**2) - p_radius
+                    
+                    # 🚨 병렬 스레드 충돌 방지를 위해 atomic_min 사용 (최단 거리만 남김)
+                    ti.atomic_min(sdf_grid[grid_i, grid_j, grid_k], dist)

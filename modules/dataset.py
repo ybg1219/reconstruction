@@ -11,7 +11,7 @@ class SDFDataset(Dataset):
     미리 계산된 SDF 그리드와 m_c 특징 그리드(.npy) 쌍을 불러와 
     8x8x8 슬라이딩 윈도우 패치(Patch) 단위로 분할하여 제공하는 학습 데이터셋.
     """
-    def __init__(self, data_dir="dataset", patch_size=8, in_memory=True, 
+    def __init__(self, data_dirs=["dataset1", "dataset2"], patch_size=8, in_memory=True, 
                  use_narrow_band=True, use_bg_sample=True, bg_sample_ratio=0.05,
                  feature_constructor=None, max_samples=None):
         super().__init__()
@@ -22,45 +22,61 @@ class SDFDataset(Dataset):
         self.use_narrow_band = use_narrow_band  
         self.use_bg_sample = use_bg_sample
         self.bg_sample_ratio = bg_sample_ratio
-        
-        self.sdf_files = sorted(glob.glob(os.path.join(data_dir, "sdf_grid*.npy")))
-        self.mc_files = sorted(glob.glob(os.path.join(data_dir, "mc_grid*.npy")))
-        self.particle_files = sorted(glob.glob(os.path.join(data_dir, "particles*.npy")))
         self.max_samples = max_samples
         
-        if len(self.sdf_files) == 0:
-            print(f"⚠️ 경고: '{data_dir}' 경로에서 데이터셋 파일을 찾지 못했습니다.")
-            self.num_shapes, self.total_samples = 0, 0
-            return
+        # 리스트가 아니라 문자열(단일 경로) 하나만 들어오면 리스트로 감싸줍니다.
+        if isinstance(data_dirs, str):
+            data_dirs = [data_dirs]
+        
+        self.sdf_files = []
+        self.mc_files = []
+        self.particle_files = []
+        
+        for d_dir in data_dirs:
+            # 해당 폴더 내의 파일들 검색
+            s_files = sorted(glob.glob(os.path.join(d_dir, "sdf_grid*.npy")))
+            m_files = sorted(glob.glob(os.path.join(d_dir, "mc_grid*.npy")))
+            p_files = sorted(glob.glob(os.path.join(d_dir, "particles*.npy")))
             
-        # =========================================================
-        # 🚨 유연성 확보: mc_grid가 없고 particles만 있을 경우 자동 변환 및 저장
-        # =========================================================
-        if len(self.mc_files) == 0 and len(self.particle_files) > 0:
-            if feature_constructor is None:
-                raise ValueError("❌ mc_grid 파일이 없습니다. particles에서 자동 생성하려면 feature_constructor를 전달해주세요.")
+            if len(s_files) == 0:
+                print(f"⚠️ 경고: '{d_dir}' 경로에 SDF 데이터가 없어 건너뜁니다.")
+                continue
+
+            # 해당 폴더에 mc_grid가 없고 particles만 있을 경우 자동 생성
+            if len(m_files) == 0 and len(p_files) > 0:
+                if feature_constructor is None:
+                    raise ValueError(f"❌ '{d_dir}' 폴더에 mc_grid가 없습니다. 생성하려면 feature_constructor를 전달해주세요.")
+                
+                print(f"🔄 '{d_dir}' 폴더: mc_grid 자동 생성을 시작합니다...")
+                for p_file in p_files:
+                    particles_np = np.load(p_file)
+                    particles_tensor = torch.tensor(particles_np, dtype=torch.float32, device=feature_constructor.device)
+                    
+                    with torch.no_grad():
+                        _, m_c, grid_shape = feature_constructor(particles_tensor)
+                    mc_grid = m_c.reshape(grid_shape).cpu().numpy()
+                    
+                    base_name = os.path.basename(p_file).replace("particles_", "mc_grid_")
+                    mc_filename = os.path.join(d_dir, base_name)
+                    
+                    np.save(mc_filename, mc_grid)
+                    m_files.append(mc_filename)
+                print(f"✅ '{d_dir}' 폴더: mc_grid 생성 완료!\n")
             
-            print(f"🔄 mc_grid 파일이 없어 particles 데이터로부터 자동 생성을 시작합니다...")
-            for p_file in self.particle_files:
-                particles_np = np.load(p_file)
-                particles_tensor = torch.tensor(particles_np, dtype=torch.float32, device=feature_constructor.device)
-                
-                # 특징맵 계산
-                with torch.no_grad():
-                    _, m_c, grid_shape = feature_constructor(particles_tensor)
-                mc_grid = m_c.reshape(grid_shape).cpu().numpy()
-                
-                # 다음 번 로드를 위해 파일로 저장 (particles_000.npy -> mc_grid_000.npy)
-                base_name = os.path.basename(p_file).replace("particles_", "mc_grid_")
-                mc_filename = os.path.join(data_dir, base_name)
-                
-                np.save(mc_filename, mc_grid)
-                self.mc_files.append(mc_filename)
-                print(f"  -> 변환 및 저장 완료: {mc_filename}")
-            print("✅ mc_grid 자동 생성 완료!\n")
+            # 🔥 각 폴더에서 수집한 파일들을 메인 리스트에 합칩니다 (짝이 맞도록 개수 제한)
+            min_len = min(len(s_files), len(m_files))
+            self.sdf_files.extend(s_files[:min_len])
+            self.mc_files.extend(m_files[:min_len])
+            self.particle_files.extend(p_files) # 파티클은 참고용으로 합침
+
         # =========================================================
 
-        self.num_shapes = min(len(self.sdf_files), len(self.mc_files))
+        if len(self.sdf_files) == 0:
+            print(f"⚠️ 경고: 제공된 모든 경로에서 데이터셋 파일을 찾지 못했습니다.")
+            self.num_shapes, self.total_samples = 0, 0
+            return
+
+        self.num_shapes = len(self.sdf_files)
         
         sample_grid = np.load(self.sdf_files[0])
         self.grid_shape = sample_grid.shape 
@@ -71,7 +87,7 @@ class SDFDataset(Dataset):
         
         # 1. 데이터 캐싱
         if self.in_memory:
-            print("💾 데이터를 메모리에 캐싱 중입니다...")
+            print(f"💾 총 {self.num_shapes}쌍의 데이터를 메모리에 캐싱 중입니다...")
             for i in range(self.num_shapes):
                 self.sdf_data.append(np.load(self.sdf_files[i]))
                 self.mc_data.append(np.load(self.mc_files[i]))
