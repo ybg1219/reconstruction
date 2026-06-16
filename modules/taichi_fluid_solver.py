@@ -37,11 +37,11 @@ class TaichiFluidSolver:
         self.stiffness = 150.0
 
         # 점성 (충분히 줘야 안정됨)
-        self.viscosity = 0.005
+        self.viscosity = 0.02
 
         # 시간 스텝 (SPH 안정 핵심)
         self.dt = 0.001
-        self.surface_tension = 0.02
+        self.surface_tension = 0.03
         self.gravity = ti.Vector([0.0, -9.8, 0.0])
 
         # smoothing length (spacing 기준으로 고정)
@@ -61,7 +61,7 @@ class TaichiFluidSolver:
         # =========================================================
         self.grid_size = self.h
         self.grid_res = int(np.ceil(domain_size / self.grid_size))
-        self.max_p_per_cell = 200
+        self.max_p_per_cell = 64
 
         self.grid_count = ti.field(dtype=ti.i32, shape=(self.grid_res**3))
         self.grid_particles = ti.field(
@@ -87,9 +87,9 @@ class TaichiFluidSolver:
     def setup_initial_fluid_block(self):
         half_d = self.domain_size / 2.0
 
-        x_range = np.arange(-half_d + 0.2, -half_d + 0.8, self.spacing)
-        y_range = np.arange(-half_d + 0.1, -half_d + 0.8, self.spacing)
-        z_range = np.arange(-half_d + 0.2, -half_d + 0.8, self.spacing)
+        x_range = np.arange(-half_d + 0.2, 0.0, self.spacing)
+        y_range = np.arange(-half_d + 0.1, 0.0, self.spacing)
+        z_range = np.arange(-half_d + 0.2, 0.0, self.spacing)
 
         X, Y, Z = np.meshgrid(x_range, y_range, z_range)
         positions = np.stack([X.flatten(), Y.flatten(), Z.flatten()], axis=-1).astype(np.float32)
@@ -358,8 +358,6 @@ class TaichiFluidSolver:
             
             window.show()
             
-            
-            
     # =========================================================
     # Dataset Generation & Utilities
     # =========================================================
@@ -402,66 +400,73 @@ class TaichiFluidSolver:
         feature_constructor = None
         if save_mc:
             # config.dx 대신 위에서 계산한 dx 사용
-            feature_constructor = FeatureConstruction(dx=dx, device=device)
+            feature_constructor = FeatureConstruction(dx=dx, particle_spacing=solver.spacing, device=device)
 
         print(f"\n🚀 Launching Optimized Fluid Simulator Pipeline...")
         print(f"   [Target Frames]: {dataset_size - start_index} | Resolution: {res}^3")
 
         # 4. 프레임 시뮬레이션 및 데이터 추출 루프
         for frame in range(start_index, dataset_size):
-            print(f"\n[{frame+1}/{dataset_size}] Simulating & Extracting Fluid State...")
+            print(f"\n[{frame+1}/{dataset_size}] Simulating Fluid State...")
             
-            # [단계 A] 유체 1스텝 전진 (내부적으로 파티클 이동)
+            # [단계 A] 유체 1스텝 전진 (내부적으로 파티클 이동은 무조건 매 프레임 실행)
             solver.step() 
             
-            # 활성화된 파티클 Numpy 배열로 추출
-            num_active = solver.get_active_particle_count()
-            solver.copy_positions_to_field(tmp_particle_field)
-            raw_particles_np = tmp_particle_field.to_numpy()[:num_active]
-
-            saved_files = []
-
-            # [단계 B] 파티클 -> SDF 필드 초고속 변환 (Spatial Hash Gather 적용)
-            if save_sdf:
-                # 🔥 수정: 정적 메서드 호출 시 클래스명 명시
-                sdf_grid = TaichiFluidSolver.convert_particles_to_sdf(
-                    particles_np=raw_particles_np,
-                    res=res,
-                    domain_size=config.domain_size,
-                    radius_ratio=1.25 # 파티클 두께 조절 (필요시 튜닝)
-                )
+            # 🔥 [핵심 수정] 4 프레임마다 한 번씩만 데이터를 추출하고 저장합니다.
+            if frame % 4 == 0:
+                print(f"   💾 [Frame {frame:03d}] Extracting & Saving Data...")
                 
-                sdf_filename = os.path.join(output_dir, f"sdf_grid_{frame:03d}.npy")
-                np.save(sdf_filename, sdf_grid)
-                saved_files.append("SDF")
+                # 활성화된 파티클 Numpy 배열로 추출
+                num_active = solver.get_active_particle_count()
+                solver.copy_positions_to_field(tmp_particle_field)
+                raw_particles_np = tmp_particle_field.to_numpy()[:num_active]
 
-            # [단계 C] 원본 파티클 저장
-            if save_particles:
-                particles_filename = os.path.join(output_dir, f"particles_{frame:03d}.npy")
-                np.save(particles_filename, raw_particles_np)
-                saved_files.append("Particles")
+                saved_files = []
 
-            # [단계 D] m_c 격자 특징맵 연산 (PyTorch)
-            if save_mc:
-                particles_tensor = torch.tensor(raw_particles_np, dtype=torch.float32, device=device)
-                
-                with torch.no_grad():
-                    # Spatial Hash & Sort가 내장된 FeatureConstruction 가동
-                    grid_nodes, m_c, grid_shape = feature_constructor(particles_tensor)
-                
-                mc_grid = m_c.reshape(grid_shape).cpu().numpy()
-                mc_filename = os.path.join(output_dir, f"mc_grid_{frame:03d}.npy")
-                np.save(mc_filename, mc_grid)
-                saved_files.append("m_c Grid")
-                
-                del particles_tensor, grid_nodes, m_c
-                torch.cuda.empty_cache()
+                # [단계 B] 파티클 -> SDF 필드 초고속 변환 (Spatial Hash Gather 적용)
+                if save_sdf:
+                    sdf_grid = TaichiFluidSolver.convert_particles_to_sdf(
+                        particles_np=raw_particles_np,
+                        res=res,
+                        domain_size=config.domain_size,
+                        radius_ratio=1.25 # 파티클 두께 조절 (필요시 튜닝)
+                    )
+                    
+                    sdf_filename = os.path.join(output_dir, f"sdf_grid_{frame:03d}.npy")
+                    np.save(sdf_filename, sdf_grid)
+                    saved_files.append("SDF")
 
-            print(f"   ✅ Saved Frame {frame:03d}: {', '.join(saved_files)} (Particles: {num_active:,})")
+                # [단계 C] 원본 파티클 저장
+                if save_particles:
+                    particles_filename = os.path.join(output_dir, f"particles_{frame:03d}.npy")
+                    np.save(particles_filename, raw_particles_np)
+                    saved_files.append("Particles")
+
+                # [단계 D] m_c 격자 특징맵 연산 (PyTorch)
+                if save_mc:
+                    particles_tensor = torch.tensor(raw_particles_np, dtype=torch.float32, device=device)
+                    
+                    with torch.no_grad():
+                        # Spatial Hash & Sort가 내장된 FeatureConstruction 가동
+                        grid_nodes, m_c, grid_shape = feature_constructor(particles_tensor)
+                    
+                    mc_grid = m_c.reshape(grid_shape).cpu().numpy()
+                    mc_filename = os.path.join(output_dir, f"mc_grid_{frame:03d}.npy")
+                    np.save(mc_filename, mc_grid)
+                    saved_files.append("m_c Grid")
+                    
+                    del particles_tensor, grid_nodes, m_c
+                    torch.cuda.empty_cache()
+
+                print(f"   ✅ Saved Frame {frame:03d}: {', '.join(saved_files)} (Particles: {num_active:,})")
+            
+            else:
+                # 저장하지 않는 프레임은 로그만 남기고 빠르게 패스합니다.
+                print(f"   ⏩ Pass saving (Physics updated)")
 
             # (선택) 다양성 확보를 위해 N 프레임마다 물방울 초기화 
             # if (frame + 1) % 20 == 0:
-            #     solver.setup_initial_fluid_block()
+            #      solver.setup_initial_fluid_block()
 
         print(f"\n🎉 Fluid Dataset successfully generated in '{output_dir}'!")
 
@@ -544,7 +549,6 @@ class TaichiFluidSolver:
         )
 
         return sdf_grid_np
-    
 
 @ti.kernel
 def _compute_sdf_scatter_kernel(
@@ -565,8 +569,8 @@ def _compute_sdf_scatter_kernel(
         sdf_grid[i, j, k] = domain_size
 
     # 2. 파티클 관점에서 주변 격자 탐색 마진(칸 수) 계산
-    dx = domain_size / (res - 1.0)
-    margin = int(p_radius / dx) + 1
+    dx = domain_size / res
+    margin = ti.cast(ti.ceil(p_radius / dx), ti.i32) + 2
 
     # 3. 모든 파티클을 병렬로 순회하며 주변 그리드에 최단 거리 갱신
     for p in range(num_particles):
@@ -575,9 +579,9 @@ def _compute_sdf_scatter_kernel(
         pz = particles[p, 2]
 
         # 현재 파티클이 위치한 중심 격자 인덱스 도출
-        base_i = int(ti.floor((px + half_d) / domain_size * (res - 1)))
-        base_j = int(ti.floor((py + half_d) / domain_size * (res - 1)))
-        base_k = int(ti.floor((pz + half_d) / domain_size * (res - 1)))
+        base_i = ti.cast(ti.round((px + half_d) / domain_size * (res - 1)), ti.i32)
+        base_j = ti.cast(ti.round((py + half_d) / domain_size * (res - 1)), ti.i32)
+        base_k = ti.cast(ti.round((pz + half_d) / domain_size * (res - 1)), ti.i32)
 
         # 파티클 반경(margin)을 덮는 이웃 격자들만 부분적으로 루프 (Narrow Band)
         for i_off in range(-margin, margin + 1):
@@ -587,13 +591,15 @@ def _compute_sdf_scatter_kernel(
                     grid_j = base_j + j_off
                     grid_k = base_k + k_off
 
-                    # 격자 노드의 정확한 월드 좌표 복원
-                    g_x = (grid_i / (res - 1.0)) * domain_size - half_d
-                    g_y = (grid_j / (res - 1.0)) * domain_size - half_d
-                    g_z = (grid_k / (res - 1.0)) * domain_size - half_d
+                    # 도메인 경계 내부에 있는 격자인지 확인
+                    if 0 <= grid_i < res and 0 <= grid_j < res and 0 <= grid_k < res:
+                        # 격자 노드의 정확한 월드 좌표 복원
+                        g_x = (grid_i / (res - 1.0)) * domain_size - half_d
+                        g_y = (grid_j / (res - 1.0)) * domain_size - half_d
+                        g_z = (grid_k / (res - 1.0)) * domain_size - half_d
 
-                    # 유클리디안 거리 계산 후 유체 반경(p_radius)을 빼서 SDF 도출
-                    dist = ti.sqrt((g_x - px)**2 + (g_y - py)**2 + (g_z - pz)**2) - p_radius
-                    
-                    # 🚨 병렬 스레드 충돌 방지를 위해 atomic_min 사용 (최단 거리만 남김)
-                    ti.atomic_min(sdf_grid[grid_i, grid_j, grid_k], dist)
+                        # 유클리디안 거리 계산 후 유체 반경(p_radius)을 빼서 SDF 도출
+                        dist = ti.sqrt((g_x - px)**2 + (g_y - py)**2 + (g_z - pz)**2) - p_radius
+                        
+                        # 🚨 병렬 스레드 충돌 방지를 위해 atomic_min 사용 (최단 거리만 남김)
+                        ti.atomic_min(sdf_grid[grid_i, grid_j, grid_k], dist)

@@ -84,18 +84,26 @@ class FeatureConstruction:
     Splatting (Scatter-Add) 기법을 사용
     """
     
-    def __init__(self, dx: float = 0.1, device: str = 'cpu'):
+    def __init__(self, dx: float = 0.1, particle_spacing: float = None, device: str = 'cpu'):
         """
         Args:
             dx: 그리드 간격
             device: 연산 기기 ('cpu' 또는 'cuda')
         """
         self.dx = dx
-        self.R = 3.0 * dx  # 커널 반경
         self.device = device
         self.domain_size = 2.0  # 전역 도메인 크기
         self.min_bound = -self.domain_size / 2.0
         self.max_bound = self.domain_size / 2.0
+        
+        if particle_spacing is not None:
+            # 파티클 간격의 2배
+            self.R = 2.0 * particle_spacing 
+        else:
+            # 기본값 (저해상도)
+            self.R = 3.0 * dx
+            
+        print(f"self.R : {self.R}")
 
         # 공간 해싱을 위한 격자 크기 및 차원 설정
         self.cell_size = self.R * 0.9
