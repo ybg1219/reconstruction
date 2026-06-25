@@ -84,7 +84,7 @@ class FeatureConstruction:
     Splatting (Scatter-Add) 기법을 사용
     """
     
-    def __init__(self, dx: float = 0.1, particle_spacing: float = None, device: str = 'cpu'):
+    def __init__(self, dx: float = 0.3, ppc: float = None, device: str = 'cpu'):
         """
         Args:
             dx: 그리드 간격
@@ -96,11 +96,12 @@ class FeatureConstruction:
         self.min_bound = -self.domain_size / 2.0
         self.max_bound = self.domain_size / 2.0
         
-        if particle_spacing is not None:
+        if ppc is not None:
+            particle_spacing = dx / (ppc ** (1.0 / 3.0))
             # 파티클 간격의 2배
-            self.R = 2.0 * particle_spacing 
+            self.R = 2*dx + particle_spacing 
         else:
-            # 기본값 (저해상도)
+            # 기본값
             self.R = 3.0 * dx
             
         print(f"self.R : {self.R}")
@@ -281,7 +282,7 @@ class FeatureConstruction:
         
         N = sorted_positions.shape[0]
 
-        # 🚨 [수정됨] 기본 경계에 오프셋을 더해 기준점을 이동시킵니다.
+        # 기본 경계에 오프셋을 더해 기준점을 이동시킵니다.
         offset_tensor = torch.tensor(offset, device=self.device)
         base_bound = self.min_bound + offset_tensor
         
@@ -292,7 +293,7 @@ class FeatureConstruction:
             rho_chunk = rho_p[i:end]
             
             # 파티클이 위치한 가장 가까운 '중앙 그리드 인덱스' 역산
-            # 🚨 [수정됨] self.min_bound 대신 base_bound(이동된 경계) 사용
+            # self.min_bound 대신 base_bound(이동된 경계) 사용
             idx_float = (p_chunk - base_bound) / self.dx
             idx_base = torch.round(idx_float).long()  # (Chunk, 3)
             
@@ -307,7 +308,7 @@ class FeatureConstruction:
             valid_mask = valid_x & valid_y & valid_z  # (Chunk, 343)
             
             # 실제 그리드 노드의 월드 좌표(x, y, z) 계산
-            # 🚨 [수정됨] self.min_bound 대신 base_bound(이동된 경계) 사용
+            # self.min_bound 대신 base_bound(이동된 경계) 사용
             neighbor_pos = base_bound + neighbor_idx.float() * self.dx
             
             # 파티클과 주변 343개 이웃 간의 정확한 유클리디안 거리 계산
@@ -321,13 +322,12 @@ class FeatureConstruction:
             # 유효한 인덱스에만 값을 남기고 밖으로 삐져나간 곳은 0으로 처리
             valid_weights = weighted_kernel[valid_mask]
             
-            # PyTorch index_put_ 연산을 위해 (x, y, z) 3D 인덱스를 1D 평면 인덱스로 쫙 폅니다.
+            # PyTorch index_put_ 연산을 위해 (x, y, z) 3D 인덱스를 1D 평면 인덱스로
             flat_indices = (neighbor_idx[..., 0] * grid_shape[1] * grid_shape[2] +
                             neighbor_idx[..., 1] * grid_shape[2] +
                             neighbor_idx[..., 2])
             valid_flat_indices = flat_indices[valid_mask]
             
-            # 🚨 [핵심] 빈 도화지에 계산된 특징값들을 한 번에 더해줍니다 (Splatting!)
             m_c_flat.index_put_((valid_flat_indices,), valid_weights, accumulate=True)
             
         return m_c_flat
@@ -516,7 +516,7 @@ class SDFNetwork(nn.Module):
 class SDFReconstruction:
     """전처리 + 네트워크 통합 클래스"""
     
-    def __init__(self, dx: float = 0.1, device: str = 'cpu'):
+    def __init__(self, dx: float = 0.1, ppc : float = None, device: str = 'cpu'):
         """
         Args:
             dx: 그리드 간격
@@ -524,9 +524,10 @@ class SDFReconstruction:
         """
         self.dx = dx
         self.device = device
-        self.feature_construction = FeatureConstruction(dx=dx, device=device)
+        self.feature_construction = FeatureConstruction(dx=dx, ppc=ppc, device=device)
         self.network = SDFNetwork().to(device)
-    
+        
+                
     def extract_local_features(self, m_c_grid: torch.Tensor, 
                                center_idx: int,
                                grid_shape: tuple,

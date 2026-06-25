@@ -400,7 +400,7 @@ class TaichiFluidSolver:
         feature_constructor = None
         if save_mc:
             # config.dx 대신 위에서 계산한 dx 사용
-            feature_constructor = FeatureConstruction(dx=dx, particle_spacing=solver.spacing, device=device)
+            feature_constructor = FeatureConstruction(dx=dx, ppc=4, device=device)
 
         print(f"\n🚀 Launching Optimized Fluid Simulator Pipeline...")
         print(f"   [Target Frames]: {dataset_size - start_index} | Resolution: {res}^3")
@@ -412,8 +412,8 @@ class TaichiFluidSolver:
             # [단계 A] 유체 1스텝 전진 (내부적으로 파티클 이동은 무조건 매 프레임 실행)
             solver.step() 
             
-            # 🔥 [핵심 수정] 4 프레임마다 한 번씩만 데이터를 추출하고 저장합니다.
-            if frame % 4 == 0:
+            # 4 프레임마다 한 번씩만 데이터를 추출하고 저장합니다.
+            if frame % 4 == 3:
                 print(f"   💾 [Frame {frame:03d}] Extracting & Saving Data...")
                 
                 # 활성화된 파티클 Numpy 배열로 추출
@@ -423,7 +423,7 @@ class TaichiFluidSolver:
 
                 saved_files = []
 
-                # [단계 B] 파티클 -> SDF 필드 초고속 변환 (Spatial Hash Gather 적용)
+                # [단계 B] 파티클 -> SDF 필드 변환 (Spatial Hash Gather 적용)
                 if save_sdf:
                     sdf_grid = TaichiFluidSolver.convert_particles_to_sdf(
                         particles_np=raw_particles_np,
@@ -514,41 +514,122 @@ class TaichiFluidSolver:
 
     @staticmethod
     def convert_particles_to_sdf(particles_np, res=256, domain_size=2.0, radius_ratio=1.0):
-        """
-        Numpy 파티클 배열을 입력받아 고해상도 SDF 그리드를 반환하는 래퍼 함수입니다.
-        
-        Args:
-            particles_np: (N, 3) 형태의 파티클 월드 좌표 배열
-            res: 변환할 SDF 그리드 해상도 (기본값 256)
-            domain_size: 시뮬레이션 물리 도메인 크기 (기본값 2.0)
-            radius_ratio: 하나의 유체 입자가 차지하는 두께 (기본 격자 크기 dx 대비 배수)
-        
-        Returns:
-            sdf_grid: (res, res, res) 형태의 Numpy SDF 배열
-        """
         num_particles = len(particles_np)
         if num_particles == 0:
             print("⚠️ 파티클 데이터가 비어 있습니다. 빈 그리드를 반환합니다.")
             return np.full((res, res, res), domain_size, dtype=np.float32)
 
-        # 출력용 빈 넘파이 배열 할당 (Taichi 커널에서 직접 덮어씀)
+        # 1. Zhu-Bridson 연산을 위한 버퍼 할당
         sdf_grid_np = np.empty((res, res, res), dtype=np.float32)
+        sum_w_np = np.zeros((res, res, res), dtype=np.float32)
+        sum_pos_np = np.zeros((res, res, res, 3), dtype=np.float32)
         
-        # 유체 파티클 하나의 물리적 반경(두께) 계산
-        dx = domain_size / (res-1.0)
+        dx = domain_size / (res - 1.0)
         p_radius = dx * radius_ratio
+        
+        # 스무딩을 위한 커널 반경 (파티클 두께의 2.5배 정도로 넉넉하게 잡아 부드러움을 극대화)
+        R_kernel = p_radius * 2.5 
+        # 허공(Positive)의 최대치 제한 (절벽 방지용 캡)
+        narrow_band_max = p_radius * 2.0 
 
-        # GPU 커널 가동
-        _compute_sdf_scatter_kernel(
+        # 2. GPU 커널 가동 (Scatter -> Gather 2-Pass 방식)
+        _compute_zhu_bridson_sdf_kernel(
             particles=particles_np.astype(np.float32),
             sdf_grid=sdf_grid_np,
+            sum_w=sum_w_np,
+            sum_pos=sum_pos_np,
             num_particles=num_particles,
             res=res,
             domain_size=domain_size,
-            p_radius=p_radius
+            p_radius=p_radius,
+            R_kernel=R_kernel,
+            narrow_band_max=narrow_band_max
         )
 
+        negative_count = np.sum(sdf_grid_np < 0.0)
+        total_cells = sdf_grid_np.size
+        print(f"📊 공간 분석: 전체 {total_cells:,}개 격자 중 유체 내부(음수) 격자는 {negative_count:,}개 ({negative_count/total_cells*100:.2f}%) 입니다.")
+
         return sdf_grid_np
+
+@ti.kernel
+def _compute_zhu_bridson_sdf_kernel(
+    particles: ti.types.ndarray(),
+    sdf_grid: ti.types.ndarray(),
+    sum_w: ti.types.ndarray(),
+    sum_pos: ti.types.ndarray(),
+    num_particles: ti.i32,
+    res: ti.i32,
+    domain_size: ti.f32,
+    p_radius: ti.f32,
+    R_kernel: ti.f32,
+    narrow_band_max: ti.f32
+):
+    half_d = domain_size / 2.0
+    dx = domain_size / (res - 1.0)
+    margin = ti.cast(ti.ceil(R_kernel / dx), ti.i32) + 1
+    poly6_coeff = 315.0 / (64.0 * math.pi * (R_kernel ** 9))
+
+    # [Pass 1] 파티클들이 주변 격자에 자신의 위치와 가중치를 흩뿌림 (Splatting)
+    for p in range(num_particles):
+        px = particles[p, 0]
+        py = particles[p, 1]
+        pz = particles[p, 2]
+
+        base_i = ti.cast(ti.round((px + half_d) / domain_size * (res - 1.0)), ti.i32)
+        base_j = ti.cast(ti.round((py + half_d) / domain_size * (res - 1.0)), ti.i32)
+        base_k = ti.cast(ti.round((pz + half_d) / domain_size * (res - 1.0)), ti.i32)
+
+        for i_off in range(-margin, margin + 1):
+            for j_off in range(-margin, margin + 1):
+                for k_off in range(-margin, margin + 1):
+                    grid_i = base_i + i_off
+                    grid_j = base_j + j_off
+                    grid_k = base_k + k_off
+
+                    if 0 <= grid_i < res and 0 <= grid_j < res and 0 <= grid_k < res:
+                        gx = (grid_i / (res - 1.0)) * domain_size - half_d
+                        gy = (grid_j / (res - 1.0)) * domain_size - half_d
+                        gz = (grid_k / (res - 1.0)) * domain_size - half_d
+
+                        dist = ti.sqrt((gx - px)**2 + (gy - py)**2 + (gz - pz)**2)
+                        
+                        # R_kernel 내부일 때만 가중치 연산
+                        if dist < R_kernel:
+                            # 🚨 [핵심 수정] Poly6 커널 수식 적용
+                            w = poly6_coeff * (R_kernel**2 - dist**2)**3 
+                            
+                            # 병렬 덧셈 (Atomic Add)
+                            ti.atomic_add(sum_w[grid_i, grid_j, grid_k], w)
+                            ti.atomic_add(sum_pos[grid_i, grid_j, grid_k, 0], w * px)
+                            ti.atomic_add(sum_pos[grid_i, grid_j, grid_k, 1], w * py)
+                            ti.atomic_add(sum_pos[grid_i, grid_j, grid_k, 2], w * pz)
+
+    # [Pass 2] 모든 격자를 돌며 모인 데이터를 바탕으로 최종 부드러운 SDF 계산
+    for i, j, k in ti.ndrange(res, res, res):
+        w_total = sum_w[i, j, k]
+        
+        # 주변에 파티클이 있어 가중치가 누적된 유효 영역
+        if w_total > 0.15:
+            # 가중 평균 중심점(Center of Mass) 계산
+            avg_x = sum_pos[i, j, k, 0] / w_total
+            avg_y = sum_pos[i, j, k, 1] / w_total
+            avg_z = sum_pos[i, j, k, 2] / w_total
+
+            gx = (i / (res - 1.0)) * domain_size - half_d
+            gy = (j / (res - 1.0)) * domain_size - half_d
+            gz = (k / (res - 1.0)) * domain_size - half_d
+
+            # 중심점까지의 거리에서 파티클 두께를 뺌
+            dist_to_avg = ti.sqrt((gx - avg_x)**2 + (gy - avg_y)**2 + (gz - avg_z)**2)
+            
+            # 너무 큰 양수값 방지를 위해 narrow_band_max로 캡핑(Clamping)
+            sdf_val = ti.min(dist_to_avg - p_radius, narrow_band_max)
+            sdf_grid[i, j, k] = sdf_val
+            
+        # 주변에 파티클이 전혀 없는 완전한 허공 (절벽 방지)
+        else:
+            sdf_grid[i, j, k] = narrow_band_max
 
 @ti.kernel
 def _compute_sdf_scatter_kernel(
@@ -569,7 +650,7 @@ def _compute_sdf_scatter_kernel(
         sdf_grid[i, j, k] = domain_size
 
     # 2. 파티클 관점에서 주변 격자 탐색 마진(칸 수) 계산
-    dx = domain_size / res
+    dx = domain_size / (res - 1)
     margin = ti.cast(ti.ceil(p_radius / dx), ti.i32) + 2
 
     # 3. 모든 파티클을 병렬로 순회하며 주변 그리드에 최단 거리 갱신

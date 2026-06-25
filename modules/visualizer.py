@@ -18,7 +18,8 @@ def save_mesh_as_obj(sdf_grid, filename="output.obj", level=0):
     """
     try:
         # Marching Cubes 알고리즘 (SDF=0 인 등가면 추출)
-        verts, faces, normals, values = measure.marching_cubes(sdf_grid, level=level)
+        verts, faces, normals, values = measure.marching_cubes(sdf_grid, level=level, step_size=1, 
+            allow_degenerate=False)
         
         # OBJ 파일 쓰기
         with open(filename, 'w') as f:
@@ -295,7 +296,7 @@ def view_obj_and_particles_interactive(filename="output.obj", particles=None, re
 # =========================================================
 
 def visualize_feature_grid(m_c_grid: torch.Tensor, 
-                          grid_nodes: torch.Tensor,
+                          grid_nodes = None,
                           title: str = "Grid Features (m_c)",
                           figsize: tuple = (10, 8)) -> plt.Figure:
     """
@@ -314,15 +315,31 @@ def visualize_feature_grid(m_c_grid: torch.Tensor,
     ax = fig.add_subplot(111, projection='3d')
     
     # 텐서를 numpy 배열로 변환
-    m_c_flat = m_c_grid.cpu().numpy() if isinstance(m_c_grid, torch.Tensor) else m_c_grid
-    m_c_flat = m_c_flat.flatten()
+    m_c_np = m_c_grid.cpu().numpy() if isinstance(m_c_grid, torch.Tensor) else m_c_grid
+    m_c_flat = m_c_np.flatten()
     
-    grid_np = grid_nodes.cpu().numpy() if isinstance(grid_nodes, torch.Tensor) else grid_nodes
-    
-    # 길이 보정: 데이터 개수가 일치하지 않는 경우를 대비한 안전 로직 (파티클 기반의 동적 추출일 때)
-    # min_len = min(len(m_c_flat), len(grid_np))
-    # m_c_flat = m_c_flat[:min_len]
-    # grid_np = grid_np[:min_len]
+    if grid_nodes is None:
+        # 입력 데이터가 3D면 형태 유지, 1D면 정육면체(큐브) 형태로 역산
+        if m_c_np.ndim == 3:
+            shape = m_c_np.shape
+        else:
+            res = int(np.round(len(m_c_flat) ** (1.0 / 3.0)))
+            shape = (res, res, res)
+            
+        print(f"💡 grid_nodes가 생략되었습니다. {shape} 해상도의 기본 공간 격자를 자동 생성합니다.")
+        
+        # -1.0 ~ 1.0 범위로 정규화된 3D 좌표축 생성
+        x = np.linspace(-1.0, 1.0, shape[0])
+        y = np.linspace(-1.0, 1.0, shape[1])
+        z = np.linspace(-1.0, 1.0, shape[2])
+        
+        X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+        # (N, 3) 형태로 쌓기
+        grid_np = np.stack([X.flatten(), Y.flatten(), Z.flatten()], axis=-1)
+        
+    else:
+        # 기존 로직 (grid_nodes가 정상적으로 들어온 경우)
+        grid_np = grid_nodes.cpu().numpy() if isinstance(grid_nodes, torch.Tensor) else grid_nodes
 
     mask = m_c_flat > 1e-5  # 값이 아주 작은 노이즈와 0을 걸러냅니다.
     
@@ -331,8 +348,8 @@ def visualize_feature_grid(m_c_grid: torch.Tensor,
     
     scatter = ax.scatter(
         grid_filtered[:, 0],
-        grid_filtered[:, 1],
         grid_filtered[:, 2],
+        grid_filtered[:, 1],
         c=m_c_filtered,
         cmap='viridis',
         s=10,
@@ -340,8 +357,8 @@ def visualize_feature_grid(m_c_grid: torch.Tensor,
     )
     
     cbar = plt.colorbar(scatter, ax=ax, label='m_c value')
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
+    ax.set_xlabel('Y')
+    ax.set_ylabel('X')
     ax.set_zlabel('Z')
     ax.set_title(title)
     plt.tight_layout()
