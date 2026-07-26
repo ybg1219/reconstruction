@@ -34,18 +34,18 @@ class TaichiFluidSolver:
         self.rho0 = 1000.0
 
         # 압력 강성 (너무 크면 폭발)
-        self.stiffness = 150.0
+        self.stiffness = 200.0
 
         # 점성 (충분히 줘야 안정됨)
-        self.viscosity = 0.02
+        self.viscosity = 0.01
 
         # 시간 스텝 (SPH 안정 핵심)
         self.dt = 0.001
-        self.surface_tension = 0.03
+        self.surface_tension = 0.01
         self.gravity = ti.Vector([0.0, -9.8, 0.0])
 
         # smoothing length (spacing 기준으로 고정)
-        self.h = self.spacing * 1.4
+        self.h = self.spacing * 1.6
         self.h2 = self.h * self.h
 
         # particle mass
@@ -400,7 +400,7 @@ class TaichiFluidSolver:
         feature_constructor = None
         if save_mc:
             # config.dx 대신 위에서 계산한 dx 사용
-            feature_constructor = FeatureConstruction(dx=dx, ppc=4, device=device)
+            feature_constructor = FeatureConstruction(dx=dx, ppc=2, device=device)
 
         print(f"\n🚀 Launching Optimized Fluid Simulator Pipeline...")
         print(f"   [Target Frames]: {dataset_size - start_index} | Resolution: {res}^3")
@@ -413,7 +413,7 @@ class TaichiFluidSolver:
             solver.step() 
             
             # 4 프레임마다 한 번씩만 데이터를 추출하고 저장합니다.
-            if frame % 4 == 3:
+            if frame % 4 == 1:
                 print(f"   💾 [Frame {frame:03d}] Extracting & Saving Data...")
                 
                 # 활성화된 파티클 Numpy 배열로 추출
@@ -528,9 +528,9 @@ class TaichiFluidSolver:
         p_radius = dx * radius_ratio
         
         # 스무딩을 위한 커널 반경 (파티클 두께의 2.5배 정도로 넉넉하게 잡아 부드러움을 극대화)
-        R_kernel = p_radius * 2.5 
+        R_kernel = p_radius * 3.0
         # 허공(Positive)의 최대치 제한 (절벽 방지용 캡)
-        narrow_band_max = p_radius * 2.0 
+        narrow_band_max = p_radius * 5.0 
 
         # 2. GPU 커널 가동 (Scatter -> Gather 2-Pass 방식)
         _compute_zhu_bridson_sdf_kernel(
@@ -610,7 +610,7 @@ def _compute_zhu_bridson_sdf_kernel(
         w_total = sum_w[i, j, k]
         
         # 주변에 파티클이 있어 가중치가 누적된 유효 영역
-        if w_total > 0.15:
+        if w_total > 0.3:
             # 가중 평균 중심점(Center of Mass) 계산
             avg_x = sum_pos[i, j, k, 0] / w_total
             avg_y = sum_pos[i, j, k, 1] / w_total
